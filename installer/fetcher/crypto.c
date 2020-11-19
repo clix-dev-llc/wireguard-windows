@@ -1,1185 +1,2012 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) 2017-2020, Loup Vaillant. All rights reserved.
  * Copyright (C) 2020 Jason A. Donenfeld. All Rights Reserved.
  */
 
 #include "crypto.h"
+#include <stdint.h>
+#include <string.h>
+#include <winternl.h>
 
-#define FOR_T(type, i, start, end) for (type i = (start); i < (end); i++)
-#define FOR(i, start, end)         FOR_T(size_t, i, start, end)
-#define COPY(dst, src, size)       FOR(i, 0, size) (dst)[i] = (src)[i]
-#define ZERO(buf, size)            FOR(i, 0, size) (buf)[i] = 0
-#define MIN(a, b)                  ((a) <= (b) ? (a) : (b))
-#define MAX(a, b)                  ((a) >= (b) ? (a) : (b))
+#if REG_DWORD == REG_DWORD_LITTLE_ENDIAN
+#define swap_le64(x) (x)
+#define swap_le32(x) (x)
+#define swap_be64(x) __builtin_bswap64(x)
+#elif REG_DWORD == REG_DWORD_BIG_ENDIAN
+#define swap_le64(x) __builtin_bswap64(x)
+#define swap_le32(x) __builtin_bswap32(x)
+#define swap_be64(x) (x)
+#endif
 
-typedef int8_t   i8;
-typedef uint8_t  u8;
-typedef int16_t  i16;
-typedef uint32_t u32;
-typedef int32_t  i32;
-typedef int64_t  i64;
-typedef uint64_t u64;
-
-static const u8 zero[32] = {0};
-
-// returns the smallest positive integer y such that
-// (x + y) % pow_2  == 0
-// Basically, it's how many bytes we need to add to "align" x.
-// Only works when pow_2 is a power of 2.
-// Note: we use ~x+1 instead of -x to avoid compiler warnings
-static size_t align(size_t x, size_t pow_2)
+static void store_le64(uint8_t *dst, uint64_t src)
 {
-	return (~x + 1) & (pow_2 - 1);
+	src = swap_le64(src);
+	__builtin_memcpy(dst, &src, sizeof(src));
 }
 
-static u32 load24_le(const u8 s[3])
+static void store_be64(uint8_t *dst, uint64_t src)
 {
-	return (u32)s[0]
-		| ((u32)s[1] <<  8)
-		| ((u32)s[2] << 16);
+	src = swap_be64(src);
+	__builtin_memcpy(dst, &src, sizeof(src));
 }
 
-static u32 load32_le(const u8 s[4])
+static uint64_t load_le64(const uint8_t *src)
 {
-	return (u32)s[0]
-		| ((u32)s[1] <<  8)
-		| ((u32)s[2] << 16)
-		| ((u32)s[3] << 24);
+	uint64_t dst;
+	__builtin_memcpy(&dst, src, sizeof(dst));
+	return swap_le64(dst);
 }
 
-static u64 load64_le(const u8 s[8])
+static uint32_t load_le32(const uint8_t *src)
 {
-	return load32_le(s) | ((u64)load32_le(s+4) << 32);
+	uint32_t dst;
+	__builtin_memcpy(&dst, src, sizeof(dst));
+	return swap_le32(dst);
 }
 
-static u64 load64_be(const u8 s[8])
+static uint64_t load_be64(const uint8_t *src)
 {
-	return((u64)s[0] << 56)
-		| ((u64)s[1] << 48)
-		| ((u64)s[2] << 40)
-		| ((u64)s[3] << 32)
-		| ((u64)s[4] << 24)
-		| ((u64)s[5] << 16)
-		| ((u64)s[6] <<  8)
-		|  (u64)s[7];
+	uint64_t dst;
+	__builtin_memcpy(&dst, src, sizeof(dst));
+	return swap_be64(dst);
 }
 
-static void store32_le(u8 out[4], u32 in)
+static uint64_t ror64(uint64_t i, unsigned int s)
 {
-	out[0] =  in        & 0xff;
-	out[1] = (in >>  8) & 0xff;
-	out[2] = (in >> 16) & 0xff;
-	out[3] = (in >> 24) & 0xff;
+	return (i >> (s & 63)) | (i << ((-s) & 63));
 }
 
-static void store64_le(u8 out[8], u64 in)
+#define mul32x32_64(a, b) (((uint64_t)(a)) * (b))
+
+typedef uint32_t bignum25519[10];
+
+static const uint32_t reduce_mask_25 = (1 << 25) - 1;
+static const uint32_t reduce_mask_26 = (1 << 26) - 1;
+
+/* out = in */
+static void curve25519_copy(bignum25519 out, const bignum25519 in)
 {
-	store32_le(out    , (u32)in );
-	store32_le(out + 4, in >> 32);
+	out[0] = in[0];
+	out[1] = in[1];
+	out[2] = in[2];
+	out[3] = in[3];
+	out[4] = in[4];
+	out[5] = in[5];
+	out[6] = in[6];
+	out[7] = in[7];
+	out[8] = in[8];
+	out[9] = in[9];
 }
 
-static void store64_be(u8 out[8], u64 in)
+/* out = a + b */
+static void curve25519_add(bignum25519 out, const bignum25519 a,
+			   const bignum25519 b)
 {
-	out[0] = (in >> 56) & 0xff;
-	out[1] = (in >> 48) & 0xff;
-	out[2] = (in >> 40) & 0xff;
-	out[3] = (in >> 32) & 0xff;
-	out[4] = (in >> 24) & 0xff;
-	out[5] = (in >> 16) & 0xff;
-	out[6] = (in >>  8) & 0xff;
-	out[7] =  in        & 0xff;
+	out[0] = a[0] + b[0];
+	out[1] = a[1] + b[1];
+	out[2] = a[2] + b[2];
+	out[3] = a[3] + b[3];
+	out[4] = a[4] + b[4];
+	out[5] = a[5] + b[5];
+	out[6] = a[6] + b[6];
+	out[7] = a[7] + b[7];
+	out[8] = a[8] + b[8];
+	out[9] = a[9] + b[9];
 }
 
-static void load64_le_buf (u64 *dst, const u8 *src, size_t size) {
-	FOR(i, 0, size) { dst[i] = load64_le(src + i*8); }
-}
-static void store64_le_buf(u8 *dst, const u64 *src, size_t size) {
-	FOR(i, 0, size) { store64_le(dst + i*8, src[i]); }
-}
-
-static u64 rotr64(u64 x, u64 n) { return (x >> n) ^ (x << (64 - n)); }
-
-static int neq0(u64 diff)
+static void curve25519_add_after_basic(bignum25519 out, const bignum25519 a,
+				       const bignum25519 b)
 {
-	// constant time comparison to zero
-	// return diff != 0 ? -1 : 0
-	u64 half = (diff >> 32) | ((u32)diff);
-	return (1 & ((half - 1) >> 32)) - 1;
+	uint32_t c;
+	out[0] = a[0] + b[0];
+	c = (out[0] >> 26);
+	out[0] &= reduce_mask_26;
+	out[1] = a[1] + b[1] + c;
+	c = (out[1] >> 25);
+	out[1] &= reduce_mask_25;
+	out[2] = a[2] + b[2] + c;
+	c = (out[2] >> 26);
+	out[2] &= reduce_mask_26;
+	out[3] = a[3] + b[3] + c;
+	c = (out[3] >> 25);
+	out[3] &= reduce_mask_25;
+	out[4] = a[4] + b[4] + c;
+	c = (out[4] >> 26);
+	out[4] &= reduce_mask_26;
+	out[5] = a[5] + b[5] + c;
+	c = (out[5] >> 25);
+	out[5] &= reduce_mask_25;
+	out[6] = a[6] + b[6] + c;
+	c = (out[6] >> 26);
+	out[6] &= reduce_mask_26;
+	out[7] = a[7] + b[7] + c;
+	c = (out[7] >> 25);
+	out[7] &= reduce_mask_25;
+	out[8] = a[8] + b[8] + c;
+	c = (out[8] >> 26);
+	out[8] &= reduce_mask_26;
+	out[9] = a[9] + b[9] + c;
+	c = (out[9] >> 25);
+	out[9] &= reduce_mask_25;
+	out[0] += 19 * c;
 }
 
-static u64 x16(const u8 a[16], const u8 b[16])
+static void curve25519_add_reduce(bignum25519 out, const bignum25519 a,
+				  const bignum25519 b)
 {
-	return (load64_le(a + 0) ^ load64_le(b + 0))
-		|  (load64_le(a + 8) ^ load64_le(b + 8));
+	uint32_t c;
+	out[0] = a[0] + b[0];
+	c = (out[0] >> 26);
+	out[0] &= reduce_mask_26;
+	out[1] = a[1] + b[1] + c;
+	c = (out[1] >> 25);
+	out[1] &= reduce_mask_25;
+	out[2] = a[2] + b[2] + c;
+	c = (out[2] >> 26);
+	out[2] &= reduce_mask_26;
+	out[3] = a[3] + b[3] + c;
+	c = (out[3] >> 25);
+	out[3] &= reduce_mask_25;
+	out[4] = a[4] + b[4] + c;
+	c = (out[4] >> 26);
+	out[4] &= reduce_mask_26;
+	out[5] = a[5] + b[5] + c;
+	c = (out[5] >> 25);
+	out[5] &= reduce_mask_25;
+	out[6] = a[6] + b[6] + c;
+	c = (out[6] >> 26);
+	out[6] &= reduce_mask_26;
+	out[7] = a[7] + b[7] + c;
+	c = (out[7] >> 25);
+	out[7] &= reduce_mask_25;
+	out[8] = a[8] + b[8] + c;
+	c = (out[8] >> 26);
+	out[8] &= reduce_mask_26;
+	out[9] = a[9] + b[9] + c;
+	c = (out[9] >> 25);
+	out[9] &= reduce_mask_25;
+	out[0] += 19 * c;
 }
-static u64 x32(const u8 a[32],const u8 b[32]){ return x16(a,b) | x16(a+16, b+16); }
-static int verify32(const u8 a[32], const u8 b[32]){ return neq0(x32(a, b)); }
-static int zerocmp32(const u8 p[32]) { return verify32(p, zero); }
 
-static const u64 iv[8] = {
-	0x6a09e667f3bcc908, 0xbb67ae8584caa73b,
-	0x3c6ef372fe94f82b, 0xa54ff53a5f1d36f1,
-	0x510e527fade682d1, 0x9b05688c2b3e6c1f,
-	0x1f83d9abfb41bd6b, 0x5be0cd19137e2179,
-};
+/* multiples of p */
+static const uint32_t twoP0 = 0x07ffffda;
+static const uint32_t twoP13579 = 0x03fffffe;
+static const uint32_t twoP2468 = 0x07fffffe;
+static const uint32_t fourP0 = 0x0fffffb4;
+static const uint32_t fourP13579 = 0x07fffffc;
+static const uint32_t fourP2468 = 0x0ffffffc;
 
-// increment the input offset
-static void blake2b_incr(blake2b_ctx *ctx)
+/* out = a - b */
+static void curve25519_sub(bignum25519 out, const bignum25519 a,
+			   const bignum25519 b)
 {
-	u64   *x = ctx->input_offset;
-	size_t y = ctx->input_idx;
-	x[0] += y;
-	if (x[0] < y) {
-		x[1]++;
+	uint32_t c;
+	out[0] = twoP0 + a[0] - b[0];
+	c = (out[0] >> 26);
+	out[0] &= reduce_mask_26;
+	out[1] = twoP13579 + a[1] - b[1] + c;
+	c = (out[1] >> 25);
+	out[1] &= reduce_mask_25;
+	out[2] = twoP2468 + a[2] - b[2] + c;
+	c = (out[2] >> 26);
+	out[2] &= reduce_mask_26;
+	out[3] = twoP13579 + a[3] - b[3] + c;
+	c = (out[3] >> 25);
+	out[3] &= reduce_mask_25;
+	out[4] = twoP2468 + a[4] - b[4] + c;
+	out[5] = twoP13579 + a[5] - b[5];
+	out[6] = twoP2468 + a[6] - b[6];
+	out[7] = twoP13579 + a[7] - b[7];
+	out[8] = twoP2468 + a[8] - b[8];
+	out[9] = twoP13579 + a[9] - b[9];
+}
+
+/* out = a - b, where a is the result of a basic op (add,sub) */
+static void curve25519_sub_after_basic(bignum25519 out, const bignum25519 a,
+				       const bignum25519 b)
+{
+	uint32_t c;
+	out[0] = fourP0 + a[0] - b[0];
+	c = (out[0] >> 26);
+	out[0] &= reduce_mask_26;
+	out[1] = fourP13579 + a[1] - b[1] + c;
+	c = (out[1] >> 25);
+	out[1] &= reduce_mask_25;
+	out[2] = fourP2468 + a[2] - b[2] + c;
+	c = (out[2] >> 26);
+	out[2] &= reduce_mask_26;
+	out[3] = fourP13579 + a[3] - b[3] + c;
+	c = (out[3] >> 25);
+	out[3] &= reduce_mask_25;
+	out[4] = fourP2468 + a[4] - b[4] + c;
+	c = (out[4] >> 26);
+	out[4] &= reduce_mask_26;
+	out[5] = fourP13579 + a[5] - b[5] + c;
+	c = (out[5] >> 25);
+	out[5] &= reduce_mask_25;
+	out[6] = fourP2468 + a[6] - b[6] + c;
+	c = (out[6] >> 26);
+	out[6] &= reduce_mask_26;
+	out[7] = fourP13579 + a[7] - b[7] + c;
+	c = (out[7] >> 25);
+	out[7] &= reduce_mask_25;
+	out[8] = fourP2468 + a[8] - b[8] + c;
+	c = (out[8] >> 26);
+	out[8] &= reduce_mask_26;
+	out[9] = fourP13579 + a[9] - b[9] + c;
+	c = (out[9] >> 25);
+	out[9] &= reduce_mask_25;
+	out[0] += 19 * c;
+}
+
+static void curve25519_sub_reduce(bignum25519 out, const bignum25519 a,
+				  const bignum25519 b)
+{
+	uint32_t c;
+	out[0] = fourP0 + a[0] - b[0];
+	c = (out[0] >> 26);
+	out[0] &= reduce_mask_26;
+	out[1] = fourP13579 + a[1] - b[1] + c;
+	c = (out[1] >> 25);
+	out[1] &= reduce_mask_25;
+	out[2] = fourP2468 + a[2] - b[2] + c;
+	c = (out[2] >> 26);
+	out[2] &= reduce_mask_26;
+	out[3] = fourP13579 + a[3] - b[3] + c;
+	c = (out[3] >> 25);
+	out[3] &= reduce_mask_25;
+	out[4] = fourP2468 + a[4] - b[4] + c;
+	c = (out[4] >> 26);
+	out[4] &= reduce_mask_26;
+	out[5] = fourP13579 + a[5] - b[5] + c;
+	c = (out[5] >> 25);
+	out[5] &= reduce_mask_25;
+	out[6] = fourP2468 + a[6] - b[6] + c;
+	c = (out[6] >> 26);
+	out[6] &= reduce_mask_26;
+	out[7] = fourP13579 + a[7] - b[7] + c;
+	c = (out[7] >> 25);
+	out[7] &= reduce_mask_25;
+	out[8] = fourP2468 + a[8] - b[8] + c;
+	c = (out[8] >> 26);
+	out[8] &= reduce_mask_26;
+	out[9] = fourP13579 + a[9] - b[9] + c;
+	c = (out[9] >> 25);
+	out[9] &= reduce_mask_25;
+	out[0] += 19 * c;
+}
+
+/* out = -a */
+static void curve25519_neg(bignum25519 out, const bignum25519 a)
+{
+	uint32_t c;
+	out[0] = twoP0 - a[0];
+	c = (out[0] >> 26);
+	out[0] &= reduce_mask_26;
+	out[1] = twoP13579 - a[1] + c;
+	c = (out[1] >> 25);
+	out[1] &= reduce_mask_25;
+	out[2] = twoP2468 - a[2] + c;
+	c = (out[2] >> 26);
+	out[2] &= reduce_mask_26;
+	out[3] = twoP13579 - a[3] + c;
+	c = (out[3] >> 25);
+	out[3] &= reduce_mask_25;
+	out[4] = twoP2468 - a[4] + c;
+	c = (out[4] >> 26);
+	out[4] &= reduce_mask_26;
+	out[5] = twoP13579 - a[5] + c;
+	c = (out[5] >> 25);
+	out[5] &= reduce_mask_25;
+	out[6] = twoP2468 - a[6] + c;
+	c = (out[6] >> 26);
+	out[6] &= reduce_mask_26;
+	out[7] = twoP13579 - a[7] + c;
+	c = (out[7] >> 25);
+	out[7] &= reduce_mask_25;
+	out[8] = twoP2468 - a[8] + c;
+	c = (out[8] >> 26);
+	out[8] &= reduce_mask_26;
+	out[9] = twoP13579 - a[9] + c;
+	c = (out[9] >> 25);
+	out[9] &= reduce_mask_25;
+	out[0] += 19 * c;
+}
+
+/* out = a * b */
+static void curve25519_mul(bignum25519 out, const bignum25519 a,
+			   const bignum25519 b)
+{
+	uint32_t r0, r1, r2, r3, r4, r5, r6, r7, r8, r9;
+	uint32_t s0, s1, s2, s3, s4, s5, s6, s7, s8, s9;
+	uint64_t m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, c;
+	uint32_t p;
+
+	r0 = b[0];
+	r1 = b[1];
+	r2 = b[2];
+	r3 = b[3];
+	r4 = b[4];
+	r5 = b[5];
+	r6 = b[6];
+	r7 = b[7];
+	r8 = b[8];
+	r9 = b[9];
+
+	s0 = a[0];
+	s1 = a[1];
+	s2 = a[2];
+	s3 = a[3];
+	s4 = a[4];
+	s5 = a[5];
+	s6 = a[6];
+	s7 = a[7];
+	s8 = a[8];
+	s9 = a[9];
+
+	m1 = mul32x32_64(r0, s1) + mul32x32_64(r1, s0);
+	m3 = mul32x32_64(r0, s3) + mul32x32_64(r1, s2) + mul32x32_64(r2, s1) +
+	     mul32x32_64(r3, s0);
+	m5 = mul32x32_64(r0, s5) + mul32x32_64(r1, s4) + mul32x32_64(r2, s3) +
+	     mul32x32_64(r3, s2) + mul32x32_64(r4, s1) + mul32x32_64(r5, s0);
+	m7 = mul32x32_64(r0, s7) + mul32x32_64(r1, s6) + mul32x32_64(r2, s5) +
+	     mul32x32_64(r3, s4) + mul32x32_64(r4, s3) + mul32x32_64(r5, s2) +
+	     mul32x32_64(r6, s1) + mul32x32_64(r7, s0);
+	m9 = mul32x32_64(r0, s9) + mul32x32_64(r1, s8) + mul32x32_64(r2, s7) +
+	     mul32x32_64(r3, s6) + mul32x32_64(r4, s5) + mul32x32_64(r5, s4) +
+	     mul32x32_64(r6, s3) + mul32x32_64(r7, s2) + mul32x32_64(r8, s1) +
+	     mul32x32_64(r9, s0);
+
+	r1 *= 2;
+	r3 *= 2;
+	r5 *= 2;
+	r7 *= 2;
+
+	m0 = mul32x32_64(r0, s0);
+	m2 = mul32x32_64(r0, s2) + mul32x32_64(r1, s1) + mul32x32_64(r2, s0);
+	m4 = mul32x32_64(r0, s4) + mul32x32_64(r1, s3) + mul32x32_64(r2, s2) +
+	     mul32x32_64(r3, s1) + mul32x32_64(r4, s0);
+	m6 = mul32x32_64(r0, s6) + mul32x32_64(r1, s5) + mul32x32_64(r2, s4) +
+	     mul32x32_64(r3, s3) + mul32x32_64(r4, s2) + mul32x32_64(r5, s1) +
+	     mul32x32_64(r6, s0);
+	m8 = mul32x32_64(r0, s8) + mul32x32_64(r1, s7) + mul32x32_64(r2, s6) +
+	     mul32x32_64(r3, s5) + mul32x32_64(r4, s4) + mul32x32_64(r5, s3) +
+	     mul32x32_64(r6, s2) + mul32x32_64(r7, s1) + mul32x32_64(r8, s0);
+
+	r1 *= 19;
+	r2 *= 19;
+	r3 = (r3 / 2) * 19;
+	r4 *= 19;
+	r5 = (r5 / 2) * 19;
+	r6 *= 19;
+	r7 = (r7 / 2) * 19;
+	r8 *= 19;
+	r9 *= 19;
+
+	m1 += (mul32x32_64(r9, s2) + mul32x32_64(r8, s3) + mul32x32_64(r7, s4) +
+	       mul32x32_64(r6, s5) + mul32x32_64(r5, s6) + mul32x32_64(r4, s7) +
+	       mul32x32_64(r3, s8) + mul32x32_64(r2, s9));
+	m3 += (mul32x32_64(r9, s4) + mul32x32_64(r8, s5) + mul32x32_64(r7, s6) +
+	       mul32x32_64(r6, s7) + mul32x32_64(r5, s8) + mul32x32_64(r4, s9));
+	m5 += (mul32x32_64(r9, s6) + mul32x32_64(r8, s7) + mul32x32_64(r7, s8) +
+	       mul32x32_64(r6, s9));
+	m7 += (mul32x32_64(r9, s8) + mul32x32_64(r8, s9));
+
+	r3 *= 2;
+	r5 *= 2;
+	r7 *= 2;
+	r9 *= 2;
+
+	m0 += (mul32x32_64(r9, s1) + mul32x32_64(r8, s2) + mul32x32_64(r7, s3) +
+	       mul32x32_64(r6, s4) + mul32x32_64(r5, s5) + mul32x32_64(r4, s6) +
+	       mul32x32_64(r3, s7) + mul32x32_64(r2, s8) + mul32x32_64(r1, s9));
+	m2 += (mul32x32_64(r9, s3) + mul32x32_64(r8, s4) + mul32x32_64(r7, s5) +
+	       mul32x32_64(r6, s6) + mul32x32_64(r5, s7) + mul32x32_64(r4, s8) +
+	       mul32x32_64(r3, s9));
+	m4 += (mul32x32_64(r9, s5) + mul32x32_64(r8, s6) + mul32x32_64(r7, s7) +
+	       mul32x32_64(r6, s8) + mul32x32_64(r5, s9));
+	m6 += (mul32x32_64(r9, s7) + mul32x32_64(r8, s8) + mul32x32_64(r7, s9));
+	m8 += (mul32x32_64(r9, s9));
+
+	r0 = (uint32_t)m0 & reduce_mask_26;
+	c = (m0 >> 26);
+	m1 += c;
+	r1 = (uint32_t)m1 & reduce_mask_25;
+	c = (m1 >> 25);
+	m2 += c;
+	r2 = (uint32_t)m2 & reduce_mask_26;
+	c = (m2 >> 26);
+	m3 += c;
+	r3 = (uint32_t)m3 & reduce_mask_25;
+	c = (m3 >> 25);
+	m4 += c;
+	r4 = (uint32_t)m4 & reduce_mask_26;
+	c = (m4 >> 26);
+	m5 += c;
+	r5 = (uint32_t)m5 & reduce_mask_25;
+	c = (m5 >> 25);
+	m6 += c;
+	r6 = (uint32_t)m6 & reduce_mask_26;
+	c = (m6 >> 26);
+	m7 += c;
+	r7 = (uint32_t)m7 & reduce_mask_25;
+	c = (m7 >> 25);
+	m8 += c;
+	r8 = (uint32_t)m8 & reduce_mask_26;
+	c = (m8 >> 26);
+	m9 += c;
+	r9 = (uint32_t)m9 & reduce_mask_25;
+	p = (uint32_t)(m9 >> 25);
+	m0 = r0 + mul32x32_64(p, 19);
+	r0 = (uint32_t)m0 & reduce_mask_26;
+	p = (uint32_t)(m0 >> 26);
+	r1 += p;
+
+	out[0] = r0;
+	out[1] = r1;
+	out[2] = r2;
+	out[3] = r3;
+	out[4] = r4;
+	out[5] = r5;
+	out[6] = r6;
+	out[7] = r7;
+	out[8] = r8;
+	out[9] = r9;
+}
+
+/* out = in*in */
+static void curve25519_square(bignum25519 out, const bignum25519 in)
+{
+	uint32_t r0, r1, r2, r3, r4, r5, r6, r7, r8, r9;
+	uint32_t d6, d7, d8, d9;
+	uint64_t m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, c;
+	uint32_t p;
+
+	r0 = in[0];
+	r1 = in[1];
+	r2 = in[2];
+	r3 = in[3];
+	r4 = in[4];
+	r5 = in[5];
+	r6 = in[6];
+	r7 = in[7];
+	r8 = in[8];
+	r9 = in[9];
+
+	m0 = mul32x32_64(r0, r0);
+	r0 *= 2;
+	m1 = mul32x32_64(r0, r1);
+	m2 = mul32x32_64(r0, r2) + mul32x32_64(r1, r1 * 2);
+	r1 *= 2;
+	m3 = mul32x32_64(r0, r3) + mul32x32_64(r1, r2);
+	m4 = mul32x32_64(r0, r4) + mul32x32_64(r1, r3 * 2) +
+	     mul32x32_64(r2, r2);
+	r2 *= 2;
+	m5 = mul32x32_64(r0, r5) + mul32x32_64(r1, r4) + mul32x32_64(r2, r3);
+	m6 = mul32x32_64(r0, r6) + mul32x32_64(r1, r5 * 2) +
+	     mul32x32_64(r2, r4) + mul32x32_64(r3, r3 * 2);
+	r3 *= 2;
+	m7 = mul32x32_64(r0, r7) + mul32x32_64(r1, r6) + mul32x32_64(r2, r5) +
+	     mul32x32_64(r3, r4);
+	m8 = mul32x32_64(r0, r8) + mul32x32_64(r1, r7 * 2) +
+	     mul32x32_64(r2, r6) + mul32x32_64(r3, r5 * 2) +
+	     mul32x32_64(r4, r4);
+	m9 = mul32x32_64(r0, r9) + mul32x32_64(r1, r8) + mul32x32_64(r2, r7) +
+	     mul32x32_64(r3, r6) + mul32x32_64(r4, r5 * 2);
+
+	d6 = r6 * 19;
+	d7 = r7 * 2 * 19;
+	d8 = r8 * 19;
+	d9 = r9 * 2 * 19;
+
+	m0 += (mul32x32_64(d9, r1) + mul32x32_64(d8, r2) + mul32x32_64(d7, r3) +
+	       mul32x32_64(d6, r4 * 2) + mul32x32_64(r5, r5 * 2 * 19));
+	m1 += (mul32x32_64(d9, r2 / 2) + mul32x32_64(d8, r3) +
+	       mul32x32_64(d7, r4) + mul32x32_64(d6, r5 * 2));
+	m2 += (mul32x32_64(d9, r3) + mul32x32_64(d8, r4 * 2) +
+	       mul32x32_64(d7, r5 * 2) + mul32x32_64(d6, r6));
+	m3 += (mul32x32_64(d9, r4) + mul32x32_64(d8, r5 * 2) +
+	       mul32x32_64(d7, r6));
+	m4 += (mul32x32_64(d9, r5 * 2) + mul32x32_64(d8, r6 * 2) +
+	       mul32x32_64(d7, r7));
+	m5 += (mul32x32_64(d9, r6) + mul32x32_64(d8, r7 * 2));
+	m6 += (mul32x32_64(d9, r7 * 2) + mul32x32_64(d8, r8));
+	m7 += (mul32x32_64(d9, r8));
+	m8 += (mul32x32_64(d9, r9));
+
+	r0 = (uint32_t)m0 & reduce_mask_26;
+	c = (m0 >> 26);
+	m1 += c;
+	r1 = (uint32_t)m1 & reduce_mask_25;
+	c = (m1 >> 25);
+	m2 += c;
+	r2 = (uint32_t)m2 & reduce_mask_26;
+	c = (m2 >> 26);
+	m3 += c;
+	r3 = (uint32_t)m3 & reduce_mask_25;
+	c = (m3 >> 25);
+	m4 += c;
+	r4 = (uint32_t)m4 & reduce_mask_26;
+	c = (m4 >> 26);
+	m5 += c;
+	r5 = (uint32_t)m5 & reduce_mask_25;
+	c = (m5 >> 25);
+	m6 += c;
+	r6 = (uint32_t)m6 & reduce_mask_26;
+	c = (m6 >> 26);
+	m7 += c;
+	r7 = (uint32_t)m7 & reduce_mask_25;
+	c = (m7 >> 25);
+	m8 += c;
+	r8 = (uint32_t)m8 & reduce_mask_26;
+	c = (m8 >> 26);
+	m9 += c;
+	r9 = (uint32_t)m9 & reduce_mask_25;
+	p = (uint32_t)(m9 >> 25);
+	m0 = r0 + mul32x32_64(p, 19);
+	r0 = (uint32_t)m0 & reduce_mask_26;
+	p = (uint32_t)(m0 >> 26);
+	r1 += p;
+
+	out[0] = r0;
+	out[1] = r1;
+	out[2] = r2;
+	out[3] = r3;
+	out[4] = r4;
+	out[5] = r5;
+	out[6] = r6;
+	out[7] = r7;
+	out[8] = r8;
+	out[9] = r9;
+}
+
+/* out = in ^ (2 * count) */
+static void curve25519_square_times(bignum25519 out, const bignum25519 in,
+				    int count)
+{
+	uint32_t r0, r1, r2, r3, r4, r5, r6, r7, r8, r9;
+	uint32_t d6, d7, d8, d9;
+	uint64_t m0, m1, m2, m3, m4, m5, m6, m7, m8, m9, c;
+	uint32_t p;
+
+	r0 = in[0];
+	r1 = in[1];
+	r2 = in[2];
+	r3 = in[3];
+	r4 = in[4];
+	r5 = in[5];
+	r6 = in[6];
+	r7 = in[7];
+	r8 = in[8];
+	r9 = in[9];
+
+	do {
+		m0 = mul32x32_64(r0, r0);
+		r0 *= 2;
+		m1 = mul32x32_64(r0, r1);
+		m2 = mul32x32_64(r0, r2) + mul32x32_64(r1, r1 * 2);
+		r1 *= 2;
+		m3 = mul32x32_64(r0, r3) + mul32x32_64(r1, r2);
+		m4 = mul32x32_64(r0, r4) + mul32x32_64(r1, r3 * 2) +
+		     mul32x32_64(r2, r2);
+		r2 *= 2;
+		m5 = mul32x32_64(r0, r5) + mul32x32_64(r1, r4) +
+		     mul32x32_64(r2, r3);
+		m6 = mul32x32_64(r0, r6) + mul32x32_64(r1, r5 * 2) +
+		     mul32x32_64(r2, r4) + mul32x32_64(r3, r3 * 2);
+		r3 *= 2;
+		m7 = mul32x32_64(r0, r7) + mul32x32_64(r1, r6) +
+		     mul32x32_64(r2, r5) + mul32x32_64(r3, r4);
+		m8 = mul32x32_64(r0, r8) + mul32x32_64(r1, r7 * 2) +
+		     mul32x32_64(r2, r6) + mul32x32_64(r3, r5 * 2) +
+		     mul32x32_64(r4, r4);
+		m9 = mul32x32_64(r0, r9) + mul32x32_64(r1, r8) +
+		     mul32x32_64(r2, r7) + mul32x32_64(r3, r6) +
+		     mul32x32_64(r4, r5 * 2);
+
+		d6 = r6 * 19;
+		d7 = r7 * 2 * 19;
+		d8 = r8 * 19;
+		d9 = r9 * 2 * 19;
+
+		m0 += (mul32x32_64(d9, r1) + mul32x32_64(d8, r2) +
+		       mul32x32_64(d7, r3) + mul32x32_64(d6, r4 * 2) +
+		       mul32x32_64(r5, r5 * 2 * 19));
+		m1 += (mul32x32_64(d9, r2 / 2) + mul32x32_64(d8, r3) +
+		       mul32x32_64(d7, r4) + mul32x32_64(d6, r5 * 2));
+		m2 += (mul32x32_64(d9, r3) + mul32x32_64(d8, r4 * 2) +
+		       mul32x32_64(d7, r5 * 2) + mul32x32_64(d6, r6));
+		m3 += (mul32x32_64(d9, r4) + mul32x32_64(d8, r5 * 2) +
+		       mul32x32_64(d7, r6));
+		m4 += (mul32x32_64(d9, r5 * 2) + mul32x32_64(d8, r6 * 2) +
+		       mul32x32_64(d7, r7));
+		m5 += (mul32x32_64(d9, r6) + mul32x32_64(d8, r7 * 2));
+		m6 += (mul32x32_64(d9, r7 * 2) + mul32x32_64(d8, r8));
+		m7 += (mul32x32_64(d9, r8));
+		m8 += (mul32x32_64(d9, r9));
+
+		r0 = (uint32_t)m0 & reduce_mask_26;
+		c = (m0 >> 26);
+		m1 += c;
+		r1 = (uint32_t)m1 & reduce_mask_25;
+		c = (m1 >> 25);
+		m2 += c;
+		r2 = (uint32_t)m2 & reduce_mask_26;
+		c = (m2 >> 26);
+		m3 += c;
+		r3 = (uint32_t)m3 & reduce_mask_25;
+		c = (m3 >> 25);
+		m4 += c;
+		r4 = (uint32_t)m4 & reduce_mask_26;
+		c = (m4 >> 26);
+		m5 += c;
+		r5 = (uint32_t)m5 & reduce_mask_25;
+		c = (m5 >> 25);
+		m6 += c;
+		r6 = (uint32_t)m6 & reduce_mask_26;
+		c = (m6 >> 26);
+		m7 += c;
+		r7 = (uint32_t)m7 & reduce_mask_25;
+		c = (m7 >> 25);
+		m8 += c;
+		r8 = (uint32_t)m8 & reduce_mask_26;
+		c = (m8 >> 26);
+		m9 += c;
+		r9 = (uint32_t)m9 & reduce_mask_25;
+		p = (uint32_t)(m9 >> 25);
+		m0 = r0 + mul32x32_64(p, 19);
+		r0 = (uint32_t)m0 & reduce_mask_26;
+		p = (uint32_t)(m0 >> 26);
+		r1 += p;
+	} while (--count);
+
+	out[0] = r0;
+	out[1] = r1;
+	out[2] = r2;
+	out[3] = r3;
+	out[4] = r4;
+	out[5] = r5;
+	out[6] = r6;
+	out[7] = r7;
+	out[8] = r8;
+	out[9] = r9;
+}
+
+/* Take a little-endian, 32-byte number and expand it into polynomial form */
+static void curve25519_expand(bignum25519 out, const uint8_t in[32])
+{
+	static const union {
+		uint8_t b[2];
+		uint16_t s;
+	} endian_check = { { 1, 0 } };
+	uint32_t x0, x1, x2, x3, x4, x5, x6, x7;
+
+	if (endian_check.s == 1) {
+		x0 = *(uint32_t *)(in + 0);
+		x1 = *(uint32_t *)(in + 4);
+		x2 = *(uint32_t *)(in + 8);
+		x3 = *(uint32_t *)(in + 12);
+		x4 = *(uint32_t *)(in + 16);
+		x5 = *(uint32_t *)(in + 20);
+		x6 = *(uint32_t *)(in + 24);
+		x7 = *(uint32_t *)(in + 28);
+	} else {
+#define F(s)                                                                   \
+	((((uint32_t)in[s + 0])) | (((uint32_t)in[s + 1]) << 8) |              \
+	 (((uint32_t)in[s + 2]) << 16) | (((uint32_t)in[s + 3]) << 24))
+		x0 = F(0);
+		x1 = F(4);
+		x2 = F(8);
+		x3 = F(12);
+		x4 = F(16);
+		x5 = F(20);
+		x6 = F(24);
+		x7 = F(28);
+#undef F
 	}
+
+	out[0] = (x0)&0x3ffffff;
+	out[1] = ((((uint64_t)x1 << 32) | x0) >> 26) & 0x1ffffff;
+	out[2] = ((((uint64_t)x2 << 32) | x1) >> 19) & 0x3ffffff;
+	out[3] = ((((uint64_t)x3 << 32) | x2) >> 13) & 0x1ffffff;
+	out[4] = ((x3) >> 6) & 0x3ffffff;
+	out[5] = (x4)&0x1ffffff;
+	out[6] = ((((uint64_t)x5 << 32) | x4) >> 25) & 0x3ffffff;
+	out[7] = ((((uint64_t)x6 << 32) | x5) >> 19) & 0x1ffffff;
+	out[8] = ((((uint64_t)x7 << 32) | x6) >> 12) & 0x3ffffff;
+	out[9] = ((x7) >> 6) & 0x1ffffff;
 }
 
-static void blake2b_compress(blake2b_ctx *ctx, int is_last_block)
+/* Take a fully reduced polynomial form number and contract it into a
+ * little-endian, 32-byte array
+ */
+static void curve25519_contract(uint8_t out[32], const bignum25519 in)
 {
-	static const u8 sigma[12][16] = {
-		{  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
-		{ 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
-		{ 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
-		{  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
-		{  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
-		{  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 },
-		{ 12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11 },
-		{ 13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10 },
-		{  6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5 },
-		{ 10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0 },
-		{  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
-		{ 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
-	};
+	bignum25519 f;
+	curve25519_copy(f, in);
 
-	// init work vector
-	u64 v0 = ctx->hash[0];  u64 v8  = iv[0];
-	u64 v1 = ctx->hash[1];  u64 v9  = iv[1];
-	u64 v2 = ctx->hash[2];  u64 v10 = iv[2];
-	u64 v3 = ctx->hash[3];  u64 v11 = iv[3];
-	u64 v4 = ctx->hash[4];  u64 v12 = iv[4] ^ ctx->input_offset[0];
-	u64 v5 = ctx->hash[5];  u64 v13 = iv[5] ^ ctx->input_offset[1];
-	u64 v6 = ctx->hash[6];  u64 v14 = iv[6] ^ (u64)~(is_last_block - 1);
-	u64 v7 = ctx->hash[7];  u64 v15 = iv[7];
+#define carry_pass()                                                           \
+	f[1] += f[0] >> 26;                                                    \
+	f[0] &= reduce_mask_26;                                                \
+	f[2] += f[1] >> 25;                                                    \
+	f[1] &= reduce_mask_25;                                                \
+	f[3] += f[2] >> 26;                                                    \
+	f[2] &= reduce_mask_26;                                                \
+	f[4] += f[3] >> 25;                                                    \
+	f[3] &= reduce_mask_25;                                                \
+	f[5] += f[4] >> 26;                                                    \
+	f[4] &= reduce_mask_26;                                                \
+	f[6] += f[5] >> 25;                                                    \
+	f[5] &= reduce_mask_25;                                                \
+	f[7] += f[6] >> 26;                                                    \
+	f[6] &= reduce_mask_26;                                                \
+	f[8] += f[7] >> 25;                                                    \
+	f[7] &= reduce_mask_25;                                                \
+	f[9] += f[8] >> 26;                                                    \
+	f[8] &= reduce_mask_26;
 
-	// mangle work vector
-	u64 *input = ctx->input;
-#define BLAKE2_G(a, b, c, d, x, y)      \
-	a += b + x;  d = rotr64(d ^ a, 32); \
-	c += d;      b = rotr64(b ^ c, 24); \
-	a += b + y;  d = rotr64(d ^ a, 16); \
-	c += d;      b = rotr64(b ^ c, 63)
-#define BLAKE2_ROUND(i)                                                 \
-	BLAKE2_G(v0, v4, v8 , v12, input[sigma[i][ 0]], input[sigma[i][ 1]]); \
-	BLAKE2_G(v1, v5, v9 , v13, input[sigma[i][ 2]], input[sigma[i][ 3]]); \
-	BLAKE2_G(v2, v6, v10, v14, input[sigma[i][ 4]], input[sigma[i][ 5]]); \
-	BLAKE2_G(v3, v7, v11, v15, input[sigma[i][ 6]], input[sigma[i][ 7]]); \
-	BLAKE2_G(v0, v5, v10, v15, input[sigma[i][ 8]], input[sigma[i][ 9]]); \
-	BLAKE2_G(v1, v6, v11, v12, input[sigma[i][10]], input[sigma[i][11]]); \
-	BLAKE2_G(v2, v7, v8 , v13, input[sigma[i][12]], input[sigma[i][13]]); \
-	BLAKE2_G(v3, v4, v9 , v14, input[sigma[i][14]], input[sigma[i][15]])
+#define carry_pass_full()                                                      \
+	carry_pass() f[0] += 19 * (f[9] >> 25);                                \
+	f[9] &= reduce_mask_25;
 
-	FOR (i, 0, 12) {
-		BLAKE2_ROUND(i);
-	}
+#define carry_pass_final() carry_pass() f[9] &= reduce_mask_25;
 
-	// update hash
-	ctx->hash[0] ^= v0 ^ v8;   ctx->hash[1] ^= v1 ^ v9;
-	ctx->hash[2] ^= v2 ^ v10;  ctx->hash[3] ^= v3 ^ v11;
-	ctx->hash[4] ^= v4 ^ v12;  ctx->hash[5] ^= v5 ^ v13;
-	ctx->hash[6] ^= v6 ^ v14;  ctx->hash[7] ^= v7 ^ v15;
+	carry_pass_full() carry_pass_full()
+
+		/* now t is between 0 and 2^255-1, properly carried. */
+		/* case 1: between 0 and 2^255-20. case 2: between 2^255-19 and 2^255-1. */
+		f[0] += 19;
+	carry_pass_full()
+
+		/* now between 19 and 2^255-1 in both cases, and offset by 19. */
+		f[0] += (reduce_mask_26 + 1) - 19;
+	f[1] += (reduce_mask_25 + 1) - 1;
+	f[2] += (reduce_mask_26 + 1) - 1;
+	f[3] += (reduce_mask_25 + 1) - 1;
+	f[4] += (reduce_mask_26 + 1) - 1;
+	f[5] += (reduce_mask_25 + 1) - 1;
+	f[6] += (reduce_mask_26 + 1) - 1;
+	f[7] += (reduce_mask_25 + 1) - 1;
+	f[8] += (reduce_mask_26 + 1) - 1;
+	f[9] += (reduce_mask_25 + 1) - 1;
+
+	/* now between 2^255 and 2^256-20, and offset by 2^255. */
+	carry_pass_final()
+
+#undef carry_pass
+#undef carry_full
+#undef carry_final
+
+		f[1] <<= 2;
+	f[2] <<= 3;
+	f[3] <<= 5;
+	f[4] <<= 6;
+	f[6] <<= 1;
+	f[7] <<= 3;
+	f[8] <<= 4;
+	f[9] <<= 6;
+
+#define F(i, s)                                                                \
+	out[s + 0] |= (uint8_t)(f[i] & 0xff);                                  \
+	out[s + 1] = (uint8_t)((f[i] >> 8) & 0xff);                            \
+	out[s + 2] = (uint8_t)((f[i] >> 16) & 0xff);                           \
+	out[s + 3] = (uint8_t)((f[i] >> 24) & 0xff);
+
+	out[0] = 0;
+	out[16] = 0;
+	F(0, 0);
+	F(1, 3);
+	F(2, 6);
+	F(3, 9);
+	F(4, 12);
+	F(5, 16);
+	F(6, 19);
+	F(7, 22);
+	F(8, 25);
+	F(9, 28);
+#undef F
 }
 
-static void blake2b_set_input(blake2b_ctx *ctx, u8 input, size_t index)
+/*
+ * In:  b =   2^5 - 2^0
+ * Out: b = 2^250 - 2^0
+ */
+static void curve25519_pow_two5mtwo0_two250mtwo0(bignum25519 b)
 {
-	if (index == 0) {
-		ZERO(ctx->input, 16);
-	}
-	size_t word = index >> 3;
-	size_t byte = index & 7;
-	ctx->input[word] |= (u64)input << (byte << 3);
+	bignum25519 t0, c;
 
+	/* 2^5  - 2^0 */ /* b */
+	/* 2^10 - 2^5 */ curve25519_square_times(t0, b, 5);
+	/* 2^10 - 2^0 */ curve25519_mul(b, t0, b);
+	/* 2^20 - 2^10 */ curve25519_square_times(t0, b, 10);
+	/* 2^20 - 2^0 */ curve25519_mul(c, t0, b);
+	/* 2^40 - 2^20 */ curve25519_square_times(t0, c, 20);
+	/* 2^40 - 2^0 */ curve25519_mul(t0, t0, c);
+	/* 2^50 - 2^10 */ curve25519_square_times(t0, t0, 10);
+	/* 2^50 - 2^0 */ curve25519_mul(b, t0, b);
+	/* 2^100 - 2^50 */ curve25519_square_times(t0, b, 50);
+	/* 2^100 - 2^0 */ curve25519_mul(c, t0, b);
+	/* 2^200 - 2^100 */ curve25519_square_times(t0, c, 100);
+	/* 2^200 - 2^0 */ curve25519_mul(t0, t0, c);
+	/* 2^250 - 2^50 */ curve25519_square_times(t0, t0, 50);
+	/* 2^250 - 2^0 */ curve25519_mul(b, t0, b);
 }
 
-static void blake2b_end_block(blake2b_ctx *ctx)
+/*
+ * z^(p - 2) = z(2^255 - 21)
+ */
+static void curve25519_recip(bignum25519 out, const bignum25519 z)
 {
-	if (ctx->input_idx == 128) {  // If buffer is full,
-		blake2b_incr(ctx);        // update the input offset
-		blake2b_compress(ctx, 0); // and compress the (not last) block
-		ctx->input_idx = 0;
-	}
+	bignum25519 a, t0, b;
+
+	/* 2 */ curve25519_square_times(a, z, 1); /* a = 2 */
+	/* 8 */ curve25519_square_times(t0, a, 2);
+	/* 9 */ curve25519_mul(b, t0, z); /* b = 9 */
+	/* 11 */ curve25519_mul(a, b, a); /* a = 11 */
+	/* 22 */ curve25519_square_times(t0, a, 1);
+	/* 2^5 - 2^0 = 31 */ curve25519_mul(b, t0, b);
+	/* 2^250 - 2^0 */ curve25519_pow_two5mtwo0_two250mtwo0(b);
+	/* 2^255 - 2^5 */ curve25519_square_times(b, b, 5);
+	/* 2^255 - 21 */ curve25519_mul(out, b, a);
 }
 
-static void blake2b_update_block(blake2b_ctx *ctx, const u8 *message, size_t message_size)
+/*
+ * z^((p-5)/8) = z^(2^252 - 3)
+ */
+static void curve25519_pow_two252m3(bignum25519 two252m3, const bignum25519 z)
 {
-	FOR (i, 0, message_size) {
-		blake2b_end_block(ctx);
-		blake2b_set_input(ctx, message[i], ctx->input_idx);
-		ctx->input_idx++;
-	}
+	bignum25519 b, c, t0;
+
+	/* 2 */ curve25519_square_times(c, z, 1); /* c = 2 */
+	/* 8 */ curve25519_square_times(t0, c, 2); /* t0 = 8 */
+	/* 9 */ curve25519_mul(b, t0, z); /* b = 9 */
+	/* 11 */ curve25519_mul(c, b, c); /* c = 11 */
+	/* 22 */ curve25519_square_times(t0, c, 1);
+	/* 2^5 - 2^0 = 31 */ curve25519_mul(b, t0, b);
+	/* 2^250 - 2^0 */ curve25519_pow_two5mtwo0_two250mtwo0(b);
+	/* 2^252 - 2^2 */ curve25519_square_times(b, b, 2);
+	/* 2^252 - 3 */ curve25519_mul(two252m3, b, z);
 }
 
-void blake2b_init(blake2b_ctx *ctx, size_t hash_size, const u8 *key, size_t key_size)
+/*
+	Arithmetic modulo the group order n = 2^252 +  27742317777372353535851937790883648493 = 7237005577332262213973186563042994240857116359379907606001950938285454250989
+	k = 32
+	b = 1 << 8 = 256
+	m = 2^252 + 27742317777372353535851937790883648493 = 0x1000000000000000000000000000000014def9dea2f79cd65812631a5cf5d3ed
+	mu = floor( b^(k*2) / m ) = 0xfffffffffffffffffffffffffffffffeb2106215d086329a7ed9ce5a30a2c131b
+*/
+
+#define bignum256modm_bits_per_limb 30
+#define bignum256modm_limb_size 9
+
+typedef uint32_t bignum256modm_element_t;
+typedef bignum256modm_element_t bignum256modm[9];
+
+static const bignum256modm modm_m = { 0x1cf5d3ed, 0x20498c69, 0x2f79cd65,
+				      0x37be77a8, 0x00000014, 0x00000000,
+				      0x00000000, 0x00000000, 0x00001000 };
+
+static const bignum256modm modm_mu = { 0x0a2c131b, 0x3673968c, 0x06329a7e,
+				       0x01885742, 0x3fffeb21, 0x3fffffff,
+				       0x3fffffff, 0x3fffffff, 0x000fffff };
+
+static bignum256modm_element_t lt_modm(bignum256modm_element_t a,
+				       bignum256modm_element_t b)
 {
-	// initial hash
-	COPY(ctx->hash, iv, 8);
-	ctx->hash[0] ^= 0x01010000 ^ (key_size << 8) ^ hash_size;
-
-	ctx->input_offset[0] = 0;         // beginning of the input, no offset
-	ctx->input_offset[1] = 0;         // beginning of the input, no offset
-	ctx->hash_size       = hash_size; // remember the hash size we want
-	ctx->input_idx       = 0;
-
-	// if there is a key, the first block is that key (padded with zeroes)
-	if (key_size > 0) {
-		u8 key_block[128] = {0};
-		COPY(key_block, key, key_size);
-		// same as calling blake2b_update(ctx, key_block , 128)
-		load64_le_buf(ctx->input, key_block, 16);
-		ctx->input_idx = 128;
-	}
+	return (a - b) >> 31;
 }
 
-void blake2b_update(blake2b_ctx *ctx, const void *message, size_t message_size)
+/* see HAC, Alg. 14.42 Step 4 */
+static void reduce256_modm(bignum256modm r)
 {
-	if (message_size == 0) {
+	bignum256modm t;
+	bignum256modm_element_t b = 0, pb, mask;
+
+	/* t = r - m */
+	pb = 0;
+	pb += modm_m[0];
+	b = lt_modm(r[0], pb);
+	t[0] = (r[0] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[1];
+	b = lt_modm(r[1], pb);
+	t[1] = (r[1] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[2];
+	b = lt_modm(r[2], pb);
+	t[2] = (r[2] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[3];
+	b = lt_modm(r[3], pb);
+	t[3] = (r[3] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[4];
+	b = lt_modm(r[4], pb);
+	t[4] = (r[4] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[5];
+	b = lt_modm(r[5], pb);
+	t[5] = (r[5] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[6];
+	b = lt_modm(r[6], pb);
+	t[6] = (r[6] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[7];
+	b = lt_modm(r[7], pb);
+	t[7] = (r[7] - pb + (b << 30));
+	pb = b;
+	pb += modm_m[8];
+	b = lt_modm(r[8], pb);
+	t[8] = (r[8] - pb + (b << 16));
+
+	/* keep r if r was smaller than m */
+	mask = b - 1;
+	r[0] ^= mask & (r[0] ^ t[0]);
+	r[1] ^= mask & (r[1] ^ t[1]);
+	r[2] ^= mask & (r[2] ^ t[2]);
+	r[3] ^= mask & (r[3] ^ t[3]);
+	r[4] ^= mask & (r[4] ^ t[4]);
+	r[5] ^= mask & (r[5] ^ t[5]);
+	r[6] ^= mask & (r[6] ^ t[6]);
+	r[7] ^= mask & (r[7] ^ t[7]);
+	r[8] ^= mask & (r[8] ^ t[8]);
+}
+
+/*
+	Barrett reduction,  see HAC, Alg. 14.42
+	Instead of passing in x, pre-process in to q1 and r1 for efficiency
+*/
+static void barrett_reduce256_modm(bignum256modm r, const bignum256modm q1,
+				   const bignum256modm r1)
+{
+	bignum256modm q3, r2;
+	uint64_t c;
+	bignum256modm_element_t f, b, pb;
+
+	/* q1 = x >> 248 = 264 bits = 9 30 bit elements
+	   q2 = mu * q1
+	   q3 = (q2 / 256(32+1)) = q2 / (2^8)^(32+1) = q2 >> 264 */
+	c = mul32x32_64(modm_mu[0], q1[7]) + mul32x32_64(modm_mu[1], q1[6]) +
+	    mul32x32_64(modm_mu[2], q1[5]) + mul32x32_64(modm_mu[3], q1[4]) +
+	    mul32x32_64(modm_mu[4], q1[3]) + mul32x32_64(modm_mu[5], q1[2]) +
+	    mul32x32_64(modm_mu[6], q1[1]) + mul32x32_64(modm_mu[7], q1[0]);
+	c >>= 30;
+	c += mul32x32_64(modm_mu[0], q1[8]) + mul32x32_64(modm_mu[1], q1[7]) +
+	     mul32x32_64(modm_mu[2], q1[6]) + mul32x32_64(modm_mu[3], q1[5]) +
+	     mul32x32_64(modm_mu[4], q1[4]) + mul32x32_64(modm_mu[5], q1[3]) +
+	     mul32x32_64(modm_mu[6], q1[2]) + mul32x32_64(modm_mu[7], q1[1]) +
+	     mul32x32_64(modm_mu[8], q1[0]);
+	f = (bignum256modm_element_t)c;
+	q3[0] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[1], q1[8]) + mul32x32_64(modm_mu[2], q1[7]) +
+	     mul32x32_64(modm_mu[3], q1[6]) + mul32x32_64(modm_mu[4], q1[5]) +
+	     mul32x32_64(modm_mu[5], q1[4]) + mul32x32_64(modm_mu[6], q1[3]) +
+	     mul32x32_64(modm_mu[7], q1[2]) + mul32x32_64(modm_mu[8], q1[1]);
+	f = (bignum256modm_element_t)c;
+	q3[0] |= (f << 6) & 0x3fffffff;
+	q3[1] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[2], q1[8]) + mul32x32_64(modm_mu[3], q1[7]) +
+	     mul32x32_64(modm_mu[4], q1[6]) + mul32x32_64(modm_mu[5], q1[5]) +
+	     mul32x32_64(modm_mu[6], q1[4]) + mul32x32_64(modm_mu[7], q1[3]) +
+	     mul32x32_64(modm_mu[8], q1[2]);
+	f = (bignum256modm_element_t)c;
+	q3[1] |= (f << 6) & 0x3fffffff;
+	q3[2] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[3], q1[8]) + mul32x32_64(modm_mu[4], q1[7]) +
+	     mul32x32_64(modm_mu[5], q1[6]) + mul32x32_64(modm_mu[6], q1[5]) +
+	     mul32x32_64(modm_mu[7], q1[4]) + mul32x32_64(modm_mu[8], q1[3]);
+	f = (bignum256modm_element_t)c;
+	q3[2] |= (f << 6) & 0x3fffffff;
+	q3[3] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[4], q1[8]) + mul32x32_64(modm_mu[5], q1[7]) +
+	     mul32x32_64(modm_mu[6], q1[6]) + mul32x32_64(modm_mu[7], q1[5]) +
+	     mul32x32_64(modm_mu[8], q1[4]);
+	f = (bignum256modm_element_t)c;
+	q3[3] |= (f << 6) & 0x3fffffff;
+	q3[4] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[5], q1[8]) + mul32x32_64(modm_mu[6], q1[7]) +
+	     mul32x32_64(modm_mu[7], q1[6]) + mul32x32_64(modm_mu[8], q1[5]);
+	f = (bignum256modm_element_t)c;
+	q3[4] |= (f << 6) & 0x3fffffff;
+	q3[5] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[6], q1[8]) + mul32x32_64(modm_mu[7], q1[7]) +
+	     mul32x32_64(modm_mu[8], q1[6]);
+	f = (bignum256modm_element_t)c;
+	q3[5] |= (f << 6) & 0x3fffffff;
+	q3[6] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[7], q1[8]) + mul32x32_64(modm_mu[8], q1[7]);
+	f = (bignum256modm_element_t)c;
+	q3[6] |= (f << 6) & 0x3fffffff;
+	q3[7] = (f >> 24) & 0x3f;
+	c >>= 30;
+	c += mul32x32_64(modm_mu[8], q1[8]);
+	f = (bignum256modm_element_t)c;
+	q3[7] |= (f << 6) & 0x3fffffff;
+	q3[8] = (bignum256modm_element_t)(c >> 24);
+
+	/* r1 = (x mod 256^(32+1)) = x mod (2^8)(31+1) = x & ((1 << 264) - 1)
+	   r2 = (q3 * m) mod (256^(32+1)) = (q3 * m) & ((1 << 264) - 1) */
+	c = mul32x32_64(modm_m[0], q3[0]);
+	r2[0] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[1]) + mul32x32_64(modm_m[1], q3[0]);
+	r2[1] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[2]) + mul32x32_64(modm_m[1], q3[1]) +
+	     mul32x32_64(modm_m[2], q3[0]);
+	r2[2] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[3]) + mul32x32_64(modm_m[1], q3[2]) +
+	     mul32x32_64(modm_m[2], q3[1]) + mul32x32_64(modm_m[3], q3[0]);
+	r2[3] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[4]) + mul32x32_64(modm_m[1], q3[3]) +
+	     mul32x32_64(modm_m[2], q3[2]) + mul32x32_64(modm_m[3], q3[1]) +
+	     mul32x32_64(modm_m[4], q3[0]);
+	r2[4] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[5]) + mul32x32_64(modm_m[1], q3[4]) +
+	     mul32x32_64(modm_m[2], q3[3]) + mul32x32_64(modm_m[3], q3[2]) +
+	     mul32x32_64(modm_m[4], q3[1]) + mul32x32_64(modm_m[5], q3[0]);
+	r2[5] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[6]) + mul32x32_64(modm_m[1], q3[5]) +
+	     mul32x32_64(modm_m[2], q3[4]) + mul32x32_64(modm_m[3], q3[3]) +
+	     mul32x32_64(modm_m[4], q3[2]) + mul32x32_64(modm_m[5], q3[1]) +
+	     mul32x32_64(modm_m[6], q3[0]);
+	r2[6] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[7]) + mul32x32_64(modm_m[1], q3[6]) +
+	     mul32x32_64(modm_m[2], q3[5]) + mul32x32_64(modm_m[3], q3[4]) +
+	     mul32x32_64(modm_m[4], q3[3]) + mul32x32_64(modm_m[5], q3[2]) +
+	     mul32x32_64(modm_m[6], q3[1]) + mul32x32_64(modm_m[7], q3[0]);
+	r2[7] = (bignum256modm_element_t)(c & 0x3fffffff);
+	c >>= 30;
+	c += mul32x32_64(modm_m[0], q3[8]) + mul32x32_64(modm_m[1], q3[7]) +
+	     mul32x32_64(modm_m[2], q3[6]) + mul32x32_64(modm_m[3], q3[5]) +
+	     mul32x32_64(modm_m[4], q3[4]) + mul32x32_64(modm_m[5], q3[3]) +
+	     mul32x32_64(modm_m[6], q3[2]) + mul32x32_64(modm_m[7], q3[1]) +
+	     mul32x32_64(modm_m[8], q3[0]);
+	r2[8] = (bignum256modm_element_t)(c & 0xffffff);
+
+	/* r = r1 - r2
+	   if (r < 0) r += (1 << 264) */
+	pb = 0;
+	pb += r2[0];
+	b = lt_modm(r1[0], pb);
+	r[0] = (r1[0] - pb + (b << 30));
+	pb = b;
+	pb += r2[1];
+	b = lt_modm(r1[1], pb);
+	r[1] = (r1[1] - pb + (b << 30));
+	pb = b;
+	pb += r2[2];
+	b = lt_modm(r1[2], pb);
+	r[2] = (r1[2] - pb + (b << 30));
+	pb = b;
+	pb += r2[3];
+	b = lt_modm(r1[3], pb);
+	r[3] = (r1[3] - pb + (b << 30));
+	pb = b;
+	pb += r2[4];
+	b = lt_modm(r1[4], pb);
+	r[4] = (r1[4] - pb + (b << 30));
+	pb = b;
+	pb += r2[5];
+	b = lt_modm(r1[5], pb);
+	r[5] = (r1[5] - pb + (b << 30));
+	pb = b;
+	pb += r2[6];
+	b = lt_modm(r1[6], pb);
+	r[6] = (r1[6] - pb + (b << 30));
+	pb = b;
+	pb += r2[7];
+	b = lt_modm(r1[7], pb);
+	r[7] = (r1[7] - pb + (b << 30));
+	pb = b;
+	pb += r2[8];
+	b = lt_modm(r1[8], pb);
+	r[8] = (r1[8] - pb + (b << 24));
+
+	reduce256_modm(r);
+	reduce256_modm(r);
+}
+
+static void expand256_modm(bignum256modm out, const uint8_t *in, size_t len)
+{
+	uint8_t work[64] = { 0 };
+	bignum256modm_element_t x[16];
+	bignum256modm q1;
+
+	memcpy(work, in, len);
+	x[0] = load_le32(work + 0);
+	x[1] = load_le32(work + 4);
+	x[2] = load_le32(work + 8);
+	x[3] = load_le32(work + 12);
+	x[4] = load_le32(work + 16);
+	x[5] = load_le32(work + 20);
+	x[6] = load_le32(work + 24);
+	x[7] = load_le32(work + 28);
+	x[8] = load_le32(work + 32);
+	x[9] = load_le32(work + 36);
+	x[10] = load_le32(work + 40);
+	x[11] = load_le32(work + 44);
+	x[12] = load_le32(work + 48);
+	x[13] = load_le32(work + 52);
+	x[14] = load_le32(work + 56);
+	x[15] = load_le32(work + 60);
+
+	/* r1 = (x mod 256^(32+1)) = x mod (2^8)(31+1) = x & ((1 << 264) - 1) */
+	out[0] = (x[0]) & 0x3fffffff;
+	out[1] = ((x[0] >> 30) | (x[1] << 2)) & 0x3fffffff;
+	out[2] = ((x[1] >> 28) | (x[2] << 4)) & 0x3fffffff;
+	out[3] = ((x[2] >> 26) | (x[3] << 6)) & 0x3fffffff;
+	out[4] = ((x[3] >> 24) | (x[4] << 8)) & 0x3fffffff;
+	out[5] = ((x[4] >> 22) | (x[5] << 10)) & 0x3fffffff;
+	out[6] = ((x[5] >> 20) | (x[6] << 12)) & 0x3fffffff;
+	out[7] = ((x[6] >> 18) | (x[7] << 14)) & 0x3fffffff;
+	out[8] = ((x[7] >> 16) | (x[8] << 16)) & 0x00ffffff;
+
+	/* 8*31 = 248 bits, no need to reduce */
+	if (len < 32)
 		return;
-	}
-	// Align ourselves with block boundaries
-	size_t aligned = MIN(align(ctx->input_idx, 128), message_size);
-	blake2b_update_block(ctx, message, aligned);
-	message      += aligned;
-	message_size -= aligned;
 
-	// Process the message block by block
-	FOR (i, 0, message_size >> 7) { // number of blocks
-		blake2b_end_block(ctx);
-		load64_le_buf(ctx->input, message, 16);
-		message += 128;
-		ctx->input_idx = 128;
-	}
-	message_size &= 127;
+	/* q1 = x >> 248 = 264 bits = 9 30 bit elements */
+	q1[0] = ((x[7] >> 24) | (x[8] << 8)) & 0x3fffffff;
+	q1[1] = ((x[8] >> 22) | (x[9] << 10)) & 0x3fffffff;
+	q1[2] = ((x[9] >> 20) | (x[10] << 12)) & 0x3fffffff;
+	q1[3] = ((x[10] >> 18) | (x[11] << 14)) & 0x3fffffff;
+	q1[4] = ((x[11] >> 16) | (x[12] << 16)) & 0x3fffffff;
+	q1[5] = ((x[12] >> 14) | (x[13] << 18)) & 0x3fffffff;
+	q1[6] = ((x[13] >> 12) | (x[14] << 20)) & 0x3fffffff;
+	q1[7] = ((x[14] >> 10) | (x[15] << 22)) & 0x3fffffff;
+	q1[8] = ((x[15] >> 8));
 
-	// remaining bytes
-	blake2b_update_block(ctx, message, message_size);
+	barrett_reduce256_modm(out, q1, out);
 }
 
-void blake2b_final(blake2b_ctx *ctx, u8 *hash)
+static void contract256_slidingwindow_modm(signed char r[256],
+					   const bignum256modm s,
+					   int windowsize)
 {
-	// Pad the end of the block with zeroes
-	FOR (i, ctx->input_idx, 128) {
-		blake2b_set_input(ctx, 0, i);
+	int i, j, k, b;
+	int m = (1 << (windowsize - 1)) - 1, soplen = 256;
+	signed char *bits = r;
+	bignum256modm_element_t v;
+
+	/* first put the binary expansion into r  */
+	for (i = 0; i < 8; i++) {
+		v = s[i];
+		for (j = 0; j < 30; j++, v >>= 1)
+			*bits++ = (v & 1);
 	}
-	blake2b_incr(ctx);        // update the input offset
-	blake2b_compress(ctx, 1); // compress the last block
-	size_t nb_words = ctx->hash_size >> 3;
-	store64_le_buf(hash, ctx->hash, nb_words);
-	FOR (i, nb_words << 3, ctx->hash_size) {
-		hash[i] = (ctx->hash[i >> 3] >> (8 * (i & 7))) & 0xff;
+	v = s[8];
+	for (j = 0; j < 16; j++, v >>= 1)
+		*bits++ = (v & 1);
+
+	/* Making it sliding window */
+	for (j = 0; j < soplen; j++) {
+		if (!r[j])
+			continue;
+
+		for (b = 1; (b < (soplen - j)) && (b <= 6); b++) {
+			if ((r[j] + (r[j + b] << b)) <= m) {
+				r[j] += r[j + b] << b;
+				r[j + b] = 0;
+			} else if ((r[j] - (r[j + b] << b)) >= -m) {
+				r[j] -= r[j + b] << b;
+				for (k = j + b; k < soplen; k++) {
+					if (!r[k]) {
+						r[k] = 1;
+						break;
+					}
+					r[k] = 0;
+				}
+			} else if (r[j + b]) {
+				break;
+			}
+		}
 	}
 }
 
-typedef struct {
-	uint64_t hash[8];
-	uint64_t input[16];
-	uint64_t input_size[2];
-	size_t   input_idx;
-} sha512_ctx;
+/*
+	Timing safe memory compare
+*/
+static int memeq(const uint8_t *x, const uint8_t *y, size_t len)
+{
+	size_t differentbits = 0;
+	while (len--)
+		differentbits |= (*x++ ^ *y++);
+	return (int)(1 & ((differentbits - 1) >> 8));
+}
 
-static u64 rot(u64 x, int c       ) { return (x >> c) | (x << (64 - c));   }
-static u64 ch (u64 x, u64 y, u64 z) { return (x & y) ^ (~x & z);           }
-static u64 maj(u64 x, u64 y, u64 z) { return (x & y) ^ ( x & z) ^ (y & z); }
-static u64 big_sigma0(u64 x) { return rot(x, 28) ^ rot(x, 34) ^ rot(x, 39); }
-static u64 big_sigma1(u64 x) { return rot(x, 14) ^ rot(x, 18) ^ rot(x, 41); }
-static u64 lit_sigma0(u64 x) { return rot(x,  1) ^ rot(x,  8) ^ (x >> 7);   }
-static u64 lit_sigma1(u64 x) { return rot(x, 19) ^ rot(x, 61) ^ (x >> 6);   }
+/*
+ * Arithmetic on the twisted Edwards curve -x^2 + y^2 = 1 + dx^2y^2
+ * with d = -(121665/121666) = 37095705934669439343138083508754565189542113879843219016388785533085940283555
+ * Base point: (15112221349535400772501151409588531511454012693041857206046113283949847762202,46316835694926478169428394003475163141307993866256225615783033603165251855960);
+ */
 
-static const u64 K[80] = {
-	0x428a2f98d728ae22,0x7137449123ef65cd,0xb5c0fbcfec4d3b2f,0xe9b5dba58189dbbc,
-	0x3956c25bf348b538,0x59f111f1b605d019,0x923f82a4af194f9b,0xab1c5ed5da6d8118,
-	0xd807aa98a3030242,0x12835b0145706fbe,0x243185be4ee4b28c,0x550c7dc3d5ffb4e2,
-	0x72be5d74f27b896f,0x80deb1fe3b1696b1,0x9bdc06a725c71235,0xc19bf174cf692694,
-	0xe49b69c19ef14ad2,0xefbe4786384f25e3,0x0fc19dc68b8cd5b5,0x240ca1cc77ac9c65,
-	0x2de92c6f592b0275,0x4a7484aa6ea6e483,0x5cb0a9dcbd41fbd4,0x76f988da831153b5,
-	0x983e5152ee66dfab,0xa831c66d2db43210,0xb00327c898fb213f,0xbf597fc7beef0ee4,
-	0xc6e00bf33da88fc2,0xd5a79147930aa725,0x06ca6351e003826f,0x142929670a0e6e70,
-	0x27b70a8546d22ffc,0x2e1b21385c26c926,0x4d2c6dfc5ac42aed,0x53380d139d95b3df,
-	0x650a73548baf63de,0x766a0abb3c77b2a8,0x81c2c92e47edaee6,0x92722c851482353b,
-	0xa2bfe8a14cf10364,0xa81a664bbc423001,0xc24b8b70d0f89791,0xc76c51a30654be30,
-	0xd192e819d6ef5218,0xd69906245565a910,0xf40e35855771202a,0x106aa07032bbd1b8,
-	0x19a4c116b8d2d0c8,0x1e376c085141ab53,0x2748774cdf8eeb99,0x34b0bcb5e19b48a8,
-	0x391c0cb3c5c95a63,0x4ed8aa4ae3418acb,0x5b9cca4f7763e373,0x682e6ff3d6b2b8a3,
-	0x748f82ee5defb2fc,0x78a5636f43172f60,0x84c87814a1f0ab72,0x8cc702081a6439ec,
-	0x90befffa23631e28,0xa4506cebde82bde9,0xbef9a3f7b2c67915,0xc67178f2e372532b,
-	0xca273eceea26619c,0xd186b8c721c0c207,0xeada7dd6cde0eb1e,0xf57d4f7fee6ed178,
-	0x06f067aa72176fba,0x0a637dc5a2c898a6,0x113f9804bef90dae,0x1b710b35131c471b,
-	0x28db77f523047d84,0x32caab7b40c72493,0x3c9ebe0a15c9bebc,0x431d67c49c100d4c,
-	0x4cc5d4becb3e42b6,0x597f299cfc657e2a,0x5fcb6fab3ad6faec,0x6c44198c4a475817
+typedef struct ge25519_t {
+	bignum25519 x, y, z, t;
+} ge25519;
+
+typedef struct ge25519_p1p1_t {
+	bignum25519 x, y, z, t;
+} ge25519_p1p1;
+
+typedef struct ge25519_niels_t {
+	bignum25519 ysubx, xaddy, t2d;
+} ge25519_niels;
+
+typedef struct ge25519_pniels_t {
+	bignum25519 ysubx, xaddy, z, t2d;
+} ge25519_pniels;
+
+/*
+	d
+*/
+
+static const bignum25519 ge25519_ecd = { 0x035978a3, 0x00d37284, 0x03156ebd,
+					 0x006a0a0e, 0x0001c029, 0x0179e898,
+					 0x03a03cbb, 0x01ce7198, 0x02e2b6ff,
+					 0x01480db3 };
+
+static const bignum25519 ge25519_ec2d = { 0x02b2f159, 0x01a6e509, 0x022add7a,
+					  0x00d4141d, 0x00038052, 0x00f3d130,
+					  0x03407977, 0x019ce331, 0x01c56dff,
+					  0x00901b67 };
+
+/*
+	sqrt(-1)
+*/
+
+static const bignum25519 ge25519_sqrtneg1 = {
+	0x020ea0b0, 0x0186c9d2, 0x008f189d, 0x0035697f, 0x00bd0c60,
+	0x01fbd7a7, 0x02804c9e, 0x01e16569, 0x0004fc1d, 0x00ae0c92
 };
 
-static void sha512_compress(sha512_ctx *ctx)
-{
-	u64 a = ctx->hash[0];    u64 b = ctx->hash[1];
-	u64 c = ctx->hash[2];    u64 d = ctx->hash[3];
-	u64 e = ctx->hash[4];    u64 f = ctx->hash[5];
-	u64 g = ctx->hash[6];    u64 h = ctx->hash[7];
-
-	FOR (j, 0, 16) {
-		u64 in = K[j] + ctx->input[j];
-		u64 t1 = big_sigma1(e) + ch (e, f, g) + h + in;
-		u64 t2 = big_sigma0(a) + maj(a, b, c);
-		h = g;  g = f;  f = e;  e = d  + t1;
-		d = c;  c = b;  b = a;  a = t1 + t2;
-	}
-	size_t i16 = 0;
-	FOR(i, 1, 5) {
-		i16 += 16;
-		FOR (j, 0, 16) {
-			ctx->input[j] += lit_sigma1(ctx->input[(j- 2) & 15]);
-			ctx->input[j] += lit_sigma0(ctx->input[(j-15) & 15]);
-			ctx->input[j] +=            ctx->input[(j- 7) & 15];
-			u64 in = K[i16 + j] + ctx->input[j];
-			u64 t1 = big_sigma1(e) + ch (e, f, g) + h + in;
-			u64 t2 = big_sigma0(a) + maj(a, b, c);
-			h = g;  g = f;  f = e;  e = d  + t1;
-			d = c;  c = b;  b = a;  a = t1 + t2;
-		}
-	}
-
-	ctx->hash[0] += a;    ctx->hash[1] += b;
-	ctx->hash[2] += c;    ctx->hash[3] += d;
-	ctx->hash[4] += e;    ctx->hash[5] += f;
-	ctx->hash[6] += g;    ctx->hash[7] += h;
-}
-
-static void sha512_set_input(sha512_ctx *ctx, u8 input)
-{
-	if (ctx->input_idx == 0) {
-		ZERO(ctx->input, 16);
-	}
-	size_t word = ctx->input_idx >> 3;
-	size_t byte = ctx->input_idx &  7;
-	ctx->input[word] |= (u64)input << (8 * (7 - byte));
-}
-
-// increment a 128-bit "word".
-static void sha512_incr(u64 x[2], u64 y)
-{
-	x[1] += y;
-	if (x[1] < y) {
-		x[0]++;
-	}
-}
-
-static void sha512_end_block(sha512_ctx *ctx)
-{
-	if (ctx->input_idx == 128) {
-		sha512_incr(ctx->input_size, 1024); // size is in bits
-		sha512_compress(ctx);
-		ctx->input_idx = 0;
-	}
-}
-
-static void sha512_update_block(sha512_ctx *ctx, const u8 *message, size_t message_size)
-{
-	FOR (i, 0, message_size) {
-		sha512_set_input(ctx, message[i]);
-		ctx->input_idx++;
-		sha512_end_block(ctx);
-	}
-}
-
-static void sha512_init(sha512_ctx *ctx)
-{
-	ctx->hash[0] = 0x6a09e667f3bcc908;
-	ctx->hash[1] = 0xbb67ae8584caa73b;
-	ctx->hash[2] = 0x3c6ef372fe94f82b;
-	ctx->hash[3] = 0xa54ff53a5f1d36f1;
-	ctx->hash[4] = 0x510e527fade682d1;
-	ctx->hash[5] = 0x9b05688c2b3e6c1f;
-	ctx->hash[6] = 0x1f83d9abfb41bd6b;
-	ctx->hash[7] = 0x5be0cd19137e2179;
-	ctx->input_size[0] = 0;
-	ctx->input_size[1] = 0;
-	ctx->input_idx = 0;
-}
-
-static void sha512_update(sha512_ctx *ctx, const u8 *message, size_t message_size)
-{
-	if (message_size == 0) {
-		return;
-	}
-	// Align ourselves with block boundaries
-	size_t aligned = MIN(align(ctx->input_idx, 128), message_size);
-	sha512_update_block(ctx, message, aligned);
-	message      += aligned;
-	message_size -= aligned;
-
-	// Process the message block by block
-	FOR (i, 0, message_size / 128) { // number of blocks
-		FOR (j, 0, 16) {
-			ctx->input[j] = load64_be(message + j*8);
-		}
-		message        += 128;
-		ctx->input_idx += 128;
-		sha512_end_block(ctx);
-	}
-	message_size &= 127;
-
-	// remaining bytes
-	sha512_update_block(ctx, message, message_size);
-}
-
-static void sha512_final(sha512_ctx *ctx, u8 hash[64])
-{
-	sha512_incr(ctx->input_size, ctx->input_idx * 8); // size is in bits
-	sha512_set_input(ctx, 128);                       // padding
-
-	// compress penultimate block (if any)
-	if (ctx->input_idx > 111) {
-		sha512_compress(ctx);
-		ZERO(ctx->input, 14);
-	}
-	// compress last block
-	ctx->input[14] = ctx->input_size[0];
-	ctx->input[15] = ctx->input_size[1];
-	sha512_compress(ctx);
-
-	// copy hash to output (big endian)
-	FOR (i, 0, 8) {
-		store64_be(hash + i*8, ctx->hash[i]);
-	}
-}
-
-// field element
-typedef i32 fe[10];
-
-// field constants
-//
-// sqrtm1      : sqrt(-1)
-// d           :     -121665 / 121666
-// D2          : 2 * -121665 / 121666
-// lop_x, lop_y: low order point in Edwards coordinates
-// ufactor     : -sqrt(-1) * 2
-// A2          : 486662^2  (A squared)
-static const fe sqrtm1  = {-32595792, -7943725, 9377950, 3500415, 12389472,
-			   -272473, -25146209, -2005654, 326686, 11406482,};
-static const fe d       = {-10913610, 13857413, -15372611, 6949391, 114729,
-			   -8787816, -6275908, -3247719, -18696448, -12055116,};
-static const fe D2      = {-21827239, -5839606, -30745221, 13898782, 229458,
-			   15978800, -12551817, -6495438, 29715968, 9444199,};
-
-static void fe_0(fe h) {           ZERO(h  , 10); }
-static void fe_1(fe h) { h[0] = 1; ZERO(h+1,  9); }
-
-static void fe_copy(fe h,const fe f           ){FOR(i,0,10) h[i] =  f[i];      }
-static void fe_neg (fe h,const fe f           ){FOR(i,0,10) h[i] = -f[i];      }
-static void fe_add (fe h,const fe f,const fe g){FOR(i,0,10) h[i] = f[i] + g[i];}
-static void fe_sub (fe h,const fe f,const fe g){FOR(i,0,10) h[i] = f[i] - g[i];}
-
-static void fe_ccopy(fe f, const fe g, int b)
-{
-	i32 mask = -b; // -1 = 0xffffffff
-	FOR (i, 0, 10) {
-		i32 x = (f[i] ^ g[i]) & mask;
-		f[i] = f[i] ^ x;
-	}
-}
-
-#define FE_CARRY                                                        \
-	i64 c0, c1, c2, c3, c4, c5, c6, c7, c8, c9;                         \
-	c0 = (t0 + ((i64)1<<25)) >> 26; t1 += c0;      t0 -= c0 * ((i64)1 << 26); \
-	c4 = (t4 + ((i64)1<<25)) >> 26; t5 += c4;      t4 -= c4 * ((i64)1 << 26); \
-	c1 = (t1 + ((i64)1<<24)) >> 25; t2 += c1;      t1 -= c1 * ((i64)1 << 25); \
-	c5 = (t5 + ((i64)1<<24)) >> 25; t6 += c5;      t5 -= c5 * ((i64)1 << 25); \
-	c2 = (t2 + ((i64)1<<25)) >> 26; t3 += c2;      t2 -= c2 * ((i64)1 << 26); \
-	c6 = (t6 + ((i64)1<<25)) >> 26; t7 += c6;      t6 -= c6 * ((i64)1 << 26); \
-	c3 = (t3 + ((i64)1<<24)) >> 25; t4 += c3;      t3 -= c3 * ((i64)1 << 25); \
-	c7 = (t7 + ((i64)1<<24)) >> 25; t8 += c7;      t7 -= c7 * ((i64)1 << 25); \
-	c4 = (t4 + ((i64)1<<25)) >> 26; t5 += c4;      t4 -= c4 * ((i64)1 << 26); \
-	c8 = (t8 + ((i64)1<<25)) >> 26; t9 += c8;      t8 -= c8 * ((i64)1 << 26); \
-	c9 = (t9 + ((i64)1<<24)) >> 25; t0 += c9 * 19; t9 -= c9 * ((i64)1 << 25); \
-	c0 = (t0 + ((i64)1<<25)) >> 26; t1 += c0;      t0 -= c0 * ((i64)1 << 26); \
-	h[0]=(i32)t0;  h[1]=(i32)t1;  h[2]=(i32)t2;  h[3]=(i32)t3;  h[4]=(i32)t4; \
-	h[5]=(i32)t5;  h[6]=(i32)t6;  h[7]=(i32)t7;  h[8]=(i32)t8;  h[9]=(i32)t9
-
-static void fe_frombytes(fe h, const u8 s[32])
-{
-	i64 t0 =  load32_le(s);
-	i64 t1 =  load24_le(s +  4) << 6;
-	i64 t2 =  load24_le(s +  7) << 5;
-	i64 t3 =  load24_le(s + 10) << 3;
-	i64 t4 =  load24_le(s + 13) << 2;
-	i64 t5 =  load32_le(s + 16);
-	i64 t6 =  load24_le(s + 20) << 7;
-	i64 t7 =  load24_le(s + 23) << 5;
-	i64 t8 =  load24_le(s + 26) << 4;
-	i64 t9 = (load24_le(s + 29) & 0x7fffff) << 2;
-	FE_CARRY;
-}
-
-static void fe_tobytes(u8 s[32], const fe h)
-{
-	i32 t[10];
-	COPY(t, h, 10);
-	i32 q = (19 * t[9] + (((i32) 1) << 24)) >> 25;
-	FOR (i, 0, 5) {
-		q += t[2*i  ]; q >>= 26;
-		q += t[2*i+1]; q >>= 25;
-	}
-	t[0] += 19 * q;
-	q = 0;
-	FOR (i, 0, 5) {
-		t[i*2  ] += q;  q = t[i*2  ] >> 26;  t[i*2  ] -= q * ((i32)1 << 26);
-		t[i*2+1] += q;  q = t[i*2+1] >> 25;  t[i*2+1] -= q * ((i32)1 << 25);
-	}
-
-	store32_le(s +  0, ((u32)t[0] >>  0) | ((u32)t[1] << 26));
-	store32_le(s +  4, ((u32)t[1] >>  6) | ((u32)t[2] << 19));
-	store32_le(s +  8, ((u32)t[2] >> 13) | ((u32)t[3] << 13));
-	store32_le(s + 12, ((u32)t[3] >> 19) | ((u32)t[4] <<  6));
-	store32_le(s + 16, ((u32)t[5] >>  0) | ((u32)t[6] << 25));
-	store32_le(s + 20, ((u32)t[6] >>  7) | ((u32)t[7] << 19));
-	store32_le(s + 24, ((u32)t[7] >> 13) | ((u32)t[8] << 12));
-	store32_le(s + 28, ((u32)t[8] >> 20) | ((u32)t[9] <<  6));
-}
-
-// multiply a field element by a signed 32-bit integer
-static void fe_mul_small(fe h, const fe f, i32 g)
-{
-	i64 t0 = f[0] * (i64) g;  i64 t1 = f[1] * (i64) g;
-	i64 t2 = f[2] * (i64) g;  i64 t3 = f[3] * (i64) g;
-	i64 t4 = f[4] * (i64) g;  i64 t5 = f[5] * (i64) g;
-	i64 t6 = f[6] * (i64) g;  i64 t7 = f[7] * (i64) g;
-	i64 t8 = f[8] * (i64) g;  i64 t9 = f[9] * (i64) g;
-	FE_CARRY;
-}
-
-static void fe_mul(fe h, const fe f, const fe g)
-{
-	// Everything is unrolled and put in temporary variables.
-	// We could roll the loop, but that would make curve25519 twice as slow.
-	i32 f0 = f[0]; i32 f1 = f[1]; i32 f2 = f[2]; i32 f3 = f[3]; i32 f4 = f[4];
-	i32 f5 = f[5]; i32 f6 = f[6]; i32 f7 = f[7]; i32 f8 = f[8]; i32 f9 = f[9];
-	i32 g0 = g[0]; i32 g1 = g[1]; i32 g2 = g[2]; i32 g3 = g[3]; i32 g4 = g[4];
-	i32 g5 = g[5]; i32 g6 = g[6]; i32 g7 = g[7]; i32 g8 = g[8]; i32 g9 = g[9];
-	i32 F1 = f1*2; i32 F3 = f3*2; i32 F5 = f5*2; i32 F7 = f7*2; i32 F9 = f9*2;
-	i32 G1 = g1*19;  i32 G2 = g2*19;  i32 G3 = g3*19;
-	i32 G4 = g4*19;  i32 G5 = g5*19;  i32 G6 = g6*19;
-	i32 G7 = g7*19;  i32 G8 = g8*19;  i32 G9 = g9*19;
-
-	i64 t0 = f0*(i64)g0 + F1*(i64)G9 + f2*(i64)G8 + F3*(i64)G7 + f4*(i64)G6
-		+    F5*(i64)G5 + f6*(i64)G4 + F7*(i64)G3 + f8*(i64)G2 + F9*(i64)G1;
-	i64 t1 = f0*(i64)g1 + f1*(i64)g0 + f2*(i64)G9 + f3*(i64)G8 + f4*(i64)G7
-		+    f5*(i64)G6 + f6*(i64)G5 + f7*(i64)G4 + f8*(i64)G3 + f9*(i64)G2;
-	i64 t2 = f0*(i64)g2 + F1*(i64)g1 + f2*(i64)g0 + F3*(i64)G9 + f4*(i64)G8
-		+    F5*(i64)G7 + f6*(i64)G6 + F7*(i64)G5 + f8*(i64)G4 + F9*(i64)G3;
-	i64 t3 = f0*(i64)g3 + f1*(i64)g2 + f2*(i64)g1 + f3*(i64)g0 + f4*(i64)G9
-		+    f5*(i64)G8 + f6*(i64)G7 + f7*(i64)G6 + f8*(i64)G5 + f9*(i64)G4;
-	i64 t4 = f0*(i64)g4 + F1*(i64)g3 + f2*(i64)g2 + F3*(i64)g1 + f4*(i64)g0
-		+    F5*(i64)G9 + f6*(i64)G8 + F7*(i64)G7 + f8*(i64)G6 + F9*(i64)G5;
-	i64 t5 = f0*(i64)g5 + f1*(i64)g4 + f2*(i64)g3 + f3*(i64)g2 + f4*(i64)g1
-		+    f5*(i64)g0 + f6*(i64)G9 + f7*(i64)G8 + f8*(i64)G7 + f9*(i64)G6;
-	i64 t6 = f0*(i64)g6 + F1*(i64)g5 + f2*(i64)g4 + F3*(i64)g3 + f4*(i64)g2
-		+    F5*(i64)g1 + f6*(i64)g0 + F7*(i64)G9 + f8*(i64)G8 + F9*(i64)G7;
-	i64 t7 = f0*(i64)g7 + f1*(i64)g6 + f2*(i64)g5 + f3*(i64)g4 + f4*(i64)g3
-		+    f5*(i64)g2 + f6*(i64)g1 + f7*(i64)g0 + f8*(i64)G9 + f9*(i64)G8;
-	i64 t8 = f0*(i64)g8 + F1*(i64)g7 + f2*(i64)g6 + F3*(i64)g5 + f4*(i64)g4
-		+    F5*(i64)g3 + f6*(i64)g2 + F7*(i64)g1 + f8*(i64)g0 + F9*(i64)G9;
-	i64 t9 = f0*(i64)g9 + f1*(i64)g8 + f2*(i64)g7 + f3*(i64)g6 + f4*(i64)g5
-		+    f5*(i64)g4 + f6*(i64)g3 + f7*(i64)g2 + f8*(i64)g1 + f9*(i64)g0;
-
-	FE_CARRY;
-}
-
-// we could use fe_mul() for this, but this is significantly faster
-static void fe_sq(fe h, const fe f)
-{
-	i32 f0 = f[0]; i32 f1 = f[1]; i32 f2 = f[2]; i32 f3 = f[3]; i32 f4 = f[4];
-	i32 f5 = f[5]; i32 f6 = f[6]; i32 f7 = f[7]; i32 f8 = f[8]; i32 f9 = f[9];
-	i32 f0_2  = f0*2;   i32 f1_2  = f1*2;   i32 f2_2  = f2*2;   i32 f3_2 = f3*2;
-	i32 f4_2  = f4*2;   i32 f5_2  = f5*2;   i32 f6_2  = f6*2;   i32 f7_2 = f7*2;
-	i32 f5_38 = f5*38;  i32 f6_19 = f6*19;  i32 f7_38 = f7*38;
-	i32 f8_19 = f8*19;  i32 f9_38 = f9*38;
-
-	i64 t0 = f0  *(i64)f0    + f1_2*(i64)f9_38 + f2_2*(i64)f8_19
-		+    f3_2*(i64)f7_38 + f4_2*(i64)f6_19 + f5  *(i64)f5_38;
-	i64 t1 = f0_2*(i64)f1    + f2  *(i64)f9_38 + f3_2*(i64)f8_19
-		+    f4  *(i64)f7_38 + f5_2*(i64)f6_19;
-	i64 t2 = f0_2*(i64)f2    + f1_2*(i64)f1    + f3_2*(i64)f9_38
-		+    f4_2*(i64)f8_19 + f5_2*(i64)f7_38 + f6  *(i64)f6_19;
-	i64 t3 = f0_2*(i64)f3    + f1_2*(i64)f2    + f4  *(i64)f9_38
-		+    f5_2*(i64)f8_19 + f6  *(i64)f7_38;
-	i64 t4 = f0_2*(i64)f4    + f1_2*(i64)f3_2  + f2  *(i64)f2
-		+    f5_2*(i64)f9_38 + f6_2*(i64)f8_19 + f7  *(i64)f7_38;
-	i64 t5 = f0_2*(i64)f5    + f1_2*(i64)f4    + f2_2*(i64)f3
-		+    f6  *(i64)f9_38 + f7_2*(i64)f8_19;
-	i64 t6 = f0_2*(i64)f6    + f1_2*(i64)f5_2  + f2_2*(i64)f4
-		+    f3_2*(i64)f3    + f7_2*(i64)f9_38 + f8  *(i64)f8_19;
-	i64 t7 = f0_2*(i64)f7    + f1_2*(i64)f6    + f2_2*(i64)f5
-		+    f3_2*(i64)f4    + f8  *(i64)f9_38;
-	i64 t8 = f0_2*(i64)f8    + f1_2*(i64)f7_2  + f2_2*(i64)f6
-		+    f3_2*(i64)f5_2  + f4  *(i64)f4    + f9  *(i64)f9_38;
-	i64 t9 = f0_2*(i64)f9    + f1_2*(i64)f8    + f2_2*(i64)f7
-		+    f3_2*(i64)f6    + f4  *(i64)f5_2;
-
-	FE_CARRY;
-}
-
-// h = 2 * (f^2)
-static void fe_sq2(fe h, const fe f)
-{
-	fe_sq(h, f);
-	fe_mul_small(h, h, 2);
-}
-
-// This could be simplified, but it would be slower
-static void fe_pow22523(fe out, const fe z)
-{
-	fe t0, t1, t2;
-	fe_sq(t0, z);
-	fe_sq(t1,t0);                   fe_sq(t1, t1);  fe_mul(t1, z, t1);
-	fe_mul(t0, t0, t1);
-	fe_sq(t0, t0);                                  fe_mul(t0, t1, t0);
-	fe_sq(t1, t0);  FOR (i, 1,   5) fe_sq(t1, t1);  fe_mul(t0, t1, t0);
-	fe_sq(t1, t0);  FOR (i, 1,  10) fe_sq(t1, t1);  fe_mul(t1, t1, t0);
-	fe_sq(t2, t1);  FOR (i, 1,  20) fe_sq(t2, t2);  fe_mul(t1, t2, t1);
-	fe_sq(t1, t1);  FOR (i, 1,  10) fe_sq(t1, t1);  fe_mul(t0, t1, t0);
-	fe_sq(t1, t0);  FOR (i, 1,  50) fe_sq(t1, t1);  fe_mul(t1, t1, t0);
-	fe_sq(t2, t1);  FOR (i, 1, 100) fe_sq(t2, t2);  fe_mul(t1, t2, t1);
-	fe_sq(t1, t1);  FOR (i, 1,  50) fe_sq(t1, t1);  fe_mul(t0, t1, t0);
-	fe_sq(t0, t0);  FOR (i, 1,   2) fe_sq(t0, t0);  fe_mul(out, t0, z);
-}
-
-// Inverting means multiplying by 2^255 - 21
-// 2^255 - 21 = (2^252 - 3) * 8 + 3
-// So we reuse the multiplication chain of fe_pow22523
-static void fe_invert(fe out, const fe z)
-{
-	fe tmp;
-	fe_pow22523(tmp, z);
-	// tmp2^8 * z^3
-	fe_sq(tmp, tmp);                        // 0
-	fe_sq(tmp, tmp);  fe_mul(tmp, tmp, z);  // 1
-	fe_sq(tmp, tmp);  fe_mul(out, tmp, z);  // 1
-}
-
-//  Parity check.  Returns 0 if even, 1 if odd
-static int fe_isodd(const fe f)
-{
-	u8 s[32];
-	fe_tobytes(s, f);
-	u8 isodd = s[0] & 1;
-	return isodd;
-}
-
-// Returns 0 if zero, 1 if non zero
-static int fe_isnonzero(const fe f)
-{
-	u8 s[32];
-	fe_tobytes(s, f);
-	int isnonzero = zerocmp32(s);
-	return -isnonzero;
-}
-
-// Returns 1 if equal, 0 if not equal
-static int fe_isequal(const fe f, const fe g)
-{
-	fe diff;
-	fe_sub(diff, f, g);
-	int isdifferent = fe_isnonzero(diff);
-	return 1 - isdifferent;
-}
-
-// Inverse square root.
-// Returns true if x is a non zero square, false otherwise.
-// After the call:
-//   isr = sqrt(1/x)        if x is non-zero square.
-//   isr = sqrt(sqrt(-1)/x) if x is not a square.
-//   isr = 0                if x is zero.
-// We do not guarantee the sign of the square root.
-//
-// Notes:
-// Let quartic = x^((p-1)/4)
-//
-// x^((p-1)/2) = chi(x)
-// quartic^2   = chi(x)
-// quartic     = sqrt(chi(x))
-// quartic     = 1 or -1 or sqrt(-1) or -sqrt(-1)
-//
-// Note that x is a square if quartic is 1 or -1
-// There are 4 cases to consider:
-//
-// if   quartic         = 1  (x is a square)
-// then x^((p-1)/4)     = 1
-//      x^((p-5)/4) * x = 1
-//      x^((p-5)/4)     = 1/x
-//      x^((p-5)/8)     = sqrt(1/x) or -sqrt(1/x)
-//
-// if   quartic                = -1  (x is a square)
-// then x^((p-1)/4)            = -1
-//      x^((p-5)/4) * x        = -1
-//      x^((p-5)/4)            = -1/x
-//      x^((p-5)/8)            = sqrt(-1)   / sqrt(x)
-//      x^((p-5)/8) * sqrt(-1) = sqrt(-1)^2 / sqrt(x)
-//      x^((p-5)/8) * sqrt(-1) = -1/sqrt(x)
-//      x^((p-5)/8) * sqrt(-1) = -sqrt(1/x) or sqrt(1/x)
-//
-// if   quartic         = sqrt(-1)  (x is not a square)
-// then x^((p-1)/4)     = sqrt(-1)
-//      x^((p-5)/4) * x = sqrt(-1)
-//      x^((p-5)/4)     = sqrt(-1)/x
-//      x^((p-5)/8)     = sqrt(sqrt(-1)/x) or -sqrt(sqrt(-1)/x)
-//
-// Note that the product of two non-squares is always a square:
-//   For any non-squares a and b, chi(a) = -1 and chi(b) = -1.
-//   Since chi(x) = x^((p-1)/2), chi(a)*chi(b) = chi(a*b) = 1.
-//   Therefore a*b is a square.
-//
-//   Since sqrt(-1) and x are both non-squares, their product is a
-//   square, and we can compute their square root.
-//
-// if   quartic                = -sqrt(-1)  (x is not a square)
-// then x^((p-1)/4)            = -sqrt(-1)
-//      x^((p-5)/4) * x        = -sqrt(-1)
-//      x^((p-5)/4)            = -sqrt(-1)/x
-//      x^((p-5)/8)            = sqrt(-sqrt(-1)/x)
-//      x^((p-5)/8)            = sqrt( sqrt(-1)/x) * sqrt(-1)
-//      x^((p-5)/8) * sqrt(-1) = sqrt( sqrt(-1)/x) * sqrt(-1)^2
-//      x^((p-5)/8) * sqrt(-1) = sqrt( sqrt(-1)/x) * -1
-//      x^((p-5)/8) * sqrt(-1) = -sqrt(sqrt(-1)/x) or sqrt(sqrt(-1)/x)
-static int invsqrt(fe isr, const fe x)
-{
-	fe check, quartic;
-	fe_copy(check, x);
-	fe_pow22523(isr, check);
-	fe_sq (quartic, isr);
-	fe_mul(quartic, quartic, check);
-	fe_1  (check);          int p1 = fe_isequal(quartic, check);
-	fe_neg(check, check );  int m1 = fe_isequal(quartic, check);
-	fe_neg(check, sqrtm1);  int ms = fe_isequal(quartic, check);
-	fe_mul(check, isr, sqrtm1);
-	fe_ccopy(isr, check, m1 | ms);
-	return p1 | m1;
-}
-
-// get bit from scalar at position i
-static int scalar_bit(const u8 s[32], int i)
-{
-	if (i < 0) { return 0; } // handle -1 for sliding windows
-	return (s[i>>3] >> (i&7)) & 1;
-}
-
-static const  u8 L[32] = {
-	0xed, 0xd3, 0xf5, 0x5c, 0x1a, 0x63, 0x12, 0x58, 0xd6, 0x9c, 0xf7, 0xa2,
-	0xde, 0xf9, 0xde, 0x14, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10
+static const ge25519_niels ge25519_niels_sliding_multiples[32] = {
+	{ { 0x0340913e, 0x000e4175, 0x03d673a2, 0x002e8a05, 0x03f4e67c,
+	    0x008f8a09, 0x00c21a34, 0x004cf4b8, 0x01298f81, 0x0113f4be },
+	  { 0x018c3b85, 0x0124f1bd, 0x01c325f7, 0x0037dc60, 0x033e4cb7,
+	    0x003d42c2, 0x01a44c32, 0x014ca4e1, 0x03a33d4b, 0x001f3e74 },
+	  { 0x037aaa68, 0x00448161, 0x0093d579, 0x011e6556, 0x009b67a0,
+	    0x0143598c, 0x01bee5ee, 0x00b50b43, 0x0289f0c6, 0x01bc45ed } },
+	{ { 0x00fcd265, 0x0047fa29, 0x034faacc, 0x01ef2e0d, 0x00ef4d4f,
+	    0x014bd6bd, 0x00f98d10, 0x014c5026, 0x007555bd, 0x00aae456 },
+	  { 0x00ee9730, 0x016c2a13, 0x017155e4, 0x01874432, 0x00096a10,
+	    0x01016732, 0x01a8014f, 0x011e9823, 0x01b9a80f, 0x01e85938 },
+	  { 0x01d0d889, 0x01a4cfc3, 0x034c4295, 0x0110e1ae, 0x0162508c,
+	    0x00f2db4c, 0x0072a2c6, 0x0098da2e, 0x02f12b9b, 0x0168a09a } },
+	{ { 0x0047d6ba, 0x0060b0e9, 0x0136eff2, 0x008a5939, 0x03540053,
+	    0x0064a087, 0x02788e5c, 0x00be7c67, 0x033eb1b5, 0x005529f9 },
+	  { 0x00a5bb33, 0x00af1102, 0x01a05442, 0x001e3af7, 0x02354123,
+	    0x00bfec44, 0x01f5862d, 0x00dd7ba3, 0x03146e20, 0x00a51733 },
+	  { 0x012a8285, 0x00f6fc60, 0x023f9797, 0x003e85ee, 0x009c3820,
+	    0x01bda72d, 0x01b3858d, 0x00d35683, 0x0296b3bb, 0x010eaaf9 } },
+	{ { 0x023221b1, 0x01cb26aa, 0x0074f74d, 0x0099ddd1, 0x01b28085,
+	    0x00192c3a, 0x013b27c9, 0x00fc13bd, 0x01d2e531, 0x0075bb75 },
+	  { 0x004ea3bf, 0x00973425, 0x001a4d63, 0x01d59cee, 0x01d1c0d4,
+	    0x00542e49, 0x01294114, 0x004fce36, 0x029283c9, 0x01186fa9 },
+	  { 0x01b8b3a2, 0x00db7200, 0x00935e30, 0x003829f5, 0x02cc0d7d,
+	    0x0077adf3, 0x0220dd2c, 0x0014ea53, 0x01c6a0f9, 0x01ea7eec } },
+	{ { 0x039d8064, 0x01885f80, 0x00337e6d, 0x01b7a902, 0x02628206,
+	    0x015eb044, 0x01e30473, 0x0191f2d9, 0x011fadc9, 0x01270169 },
+	  { 0x02a8632f, 0x0199e2a9, 0x00d8b365, 0x017a8de2, 0x02994279,
+	    0x0086f5b5, 0x0119e4e3, 0x01eb39d6, 0x0338add7, 0x00d2e7b4 },
+	  { 0x0045af1b, 0x013a2fe4, 0x0245e0d6, 0x014538ce, 0x038bfe0f,
+	    0x01d4cf16, 0x037e14c9, 0x0160d55e, 0x0021b008, 0x01cf05c8 } },
+	{ { 0x01864348, 0x01d6c092, 0x0070262b, 0x014bb844, 0x00fb5acd,
+	    0x008deb95, 0x003aaab5, 0x00eff474, 0x00029d5c, 0x0062ad66 },
+	  { 0x02802ade, 0x01c02122, 0x01c4e5f7, 0x00781181, 0x039767fb,
+	    0x01703406, 0x0342388b, 0x01f5e227, 0x022546d8, 0x0109d6ab },
+	  { 0x016089e9, 0x00cb317f, 0x00949b05, 0x01099417, 0x000c7ad2,
+	    0x011a8622, 0x0088ccda, 0x01290886, 0x022b53df, 0x00f71954 } },
+	{ { 0x027fbf93, 0x01c04ecc, 0x01ed6a0d, 0x004cdbbb, 0x02bbf3af,
+	    0x00ad5968, 0x01591955, 0x0094f3a2, 0x02d17602, 0x00099e20 },
+	  { 0x02007f6d, 0x003088a8, 0x03db77ee, 0x00d5ade6, 0x02fe12ce,
+	    0x0107ba07, 0x0107097d, 0x00482a6f, 0x02ec346f, 0x008d3f5f },
+	  { 0x032ea378, 0x0028465c, 0x028e2a6c, 0x018efc6e, 0x0090df9a,
+	    0x01a7e533, 0x039bfc48, 0x010c745d, 0x03daa097, 0x0125ee9b } },
+	{ { 0x028ccf0b, 0x00f36191, 0x021ac081, 0x012154c8, 0x034e0a6e,
+	    0x01b25192, 0x00180403, 0x01d7eea1, 0x00218d05, 0x010ed735 },
+	  { 0x03cfeaa0, 0x01b300c4, 0x008da499, 0x0068c4e1, 0x0219230a,
+	    0x01f2d4d0, 0x02defd60, 0x00e565b7, 0x017f12de, 0x018788a4 },
+	  { 0x03d0b516, 0x009d8be6, 0x03ddcbb3, 0x0071b9fe, 0x03ace2bd,
+	    0x01d64270, 0x032d3ec9, 0x01084065, 0x0210ae4d, 0x01447584 } },
+	{ { 0x0020de87, 0x00e19211, 0x01b68102, 0x00b5ac97, 0x022873c0,
+	    0x01942d25, 0x01271394, 0x0102073f, 0x02fe2482, 0x01c69ff9 },
+	  { 0x010e9d81, 0x019dbbe5, 0x0089f258, 0x006e06b8, 0x02951883,
+	    0x018f1248, 0x019b3237, 0x00bc7553, 0x024ddb85, 0x01b4c964 },
+	  { 0x01c8c854, 0x0060ae29, 0x01406d8e, 0x01cff2f9, 0x00cff451,
+	    0x01778d0c, 0x03ac8c41, 0x01552e59, 0x036559ee, 0x011d1b12 } },
+	{ { 0x00741147, 0x0151b219, 0x01092690, 0x00e877e6, 0x01f4d6bb,
+	    0x0072a332, 0x01cd3b03, 0x00dadff2, 0x0097db5e, 0x0086598d },
+	  { 0x01c69a2b, 0x01decf1b, 0x02c2fa6e, 0x013b7c4f, 0x037beac8,
+	    0x013a16b5, 0x028e7bda, 0x01f6e8ac, 0x01e34fe9, 0x01726947 },
+	  { 0x01f10e67, 0x003c73de, 0x022b7ea2, 0x010f32c2, 0x03ff776a,
+	    0x00142277, 0x01d38b88, 0x00776138, 0x03c60822, 0x01201140 } },
+	{ { 0x0236d175, 0x0008748e, 0x03c6476d, 0x013f4cdc, 0x02eed02a,
+	    0x00838a47, 0x032e7210, 0x018bcbb3, 0x00858de4, 0x01dc7826 },
+	  { 0x00a37fc7, 0x0127b40b, 0x01957884, 0x011d30ad, 0x02816683,
+	    0x016e0e23, 0x00b76be4, 0x012db115, 0x02516506, 0x0154ce62 },
+	  { 0x00451edf, 0x00bd749e, 0x03997342, 0x01cc2c4c, 0x00eb6975,
+	    0x01a59508, 0x03a516cf, 0x00c228ef, 0x0168ff5a, 0x01697b47 } },
+	{ { 0x00527359, 0x01783156, 0x03afd75c, 0x00ce56dc, 0x00e4b970,
+	    0x001cabe9, 0x029e0f6d, 0x0188850c, 0x0135fefd, 0x00066d80 },
+	  { 0x02150e83, 0x01448abf, 0x02bb0232, 0x012bf259, 0x033c8268,
+	    0x00711e20, 0x03fc148f, 0x005e0e70, 0x017d8bf9, 0x0112b2e2 },
+	  { 0x02134b83, 0x001a0517, 0x0182c3cc, 0x00792182, 0x0313d799,
+	    0x001a3ed7, 0x0344547e, 0x01f24a0d, 0x03de6ad2, 0x00543127 } },
+	{ { 0x00dca868, 0x00618f27, 0x015a1709, 0x00ddc38a, 0x0320fd13,
+	    0x0036168d, 0x0371ab06, 0x01783fc7, 0x0391e05f, 0x01e29b5d },
+	  { 0x01471138, 0x00fca542, 0x00ca31cf, 0x01ca7bad, 0x0175bfbc,
+	    0x01a708ad, 0x03bce212, 0x01244215, 0x0075bb99, 0x01acad68 },
+	  { 0x03a0b976, 0x01dc12d1, 0x011aab17, 0x00aba0ba, 0x029806cd,
+	    0x0142f590, 0x018fd8ea, 0x01a01545, 0x03c4ad55, 0x01c971ff } },
+	{ { 0x00d098c0, 0x000afdc7, 0x006cd230, 0x01276af3, 0x03f905b2,
+	    0x0102994c, 0x002eb8a4, 0x015cfbeb, 0x025f855f, 0x01335518 },
+	  { 0x01cf99b2, 0x0099c574, 0x01a69c88, 0x00881510, 0x01cd4b54,
+	    0x0112109f, 0x008abdc5, 0x0074647a, 0x0277cb1f, 0x01e53324 },
+	  { 0x02ac5053, 0x01b109b0, 0x024b095e, 0x016997b3, 0x02f26bb6,
+	    0x00311021, 0x00197885, 0x01d0a55a, 0x03b6fcc8, 0x01c020d5 } },
+	{ { 0x02584a34, 0x00e7eee0, 0x03257a03, 0x011e95a3, 0x011ead91,
+	    0x00536202, 0x00b1ce24, 0x008516c6, 0x03669d6d, 0x004ea4a8 },
+	  { 0x00773f01, 0x0019c9ce, 0x019f6171, 0x01d4afde, 0x02e33323,
+	    0x01ad29b6, 0x02ead1dc, 0x01ed51a5, 0x01851ad0, 0x001bbdfa },
+	  { 0x00577de5, 0x00ddc730, 0x038b9952, 0x00f281ae, 0x01d50390,
+	    0x0002e071, 0x000780ec, 0x010d448d, 0x01f8a2af, 0x00f0a5b7 } },
+	{ { 0x031f2541, 0x00d34bae, 0x0323ff9d, 0x003a056d, 0x02e25443,
+	    0x00a1ad05, 0x00d1bee8, 0x002f7f8e, 0x03007477, 0x002a24b1 },
+	  { 0x0114a713, 0x01457e76, 0x032255d5, 0x01cc647f, 0x02a4bdef,
+	    0x0153d730, 0x00118bcf, 0x00f755ff, 0x013490c7, 0x01ea674e },
+	  { 0x02bda3e8, 0x00bb490d, 0x00f291ea, 0x000abf40, 0x01dea321,
+	    0x002f9ce0, 0x00b2b193, 0x00fa54b5, 0x0128302f, 0x00a19d8b } },
+	{ { 0x022ef5bd, 0x01638af3, 0x038c6f8a, 0x01a33a3d, 0x039261b2,
+	    0x01bb89b8, 0x010bcf9d, 0x00cf42a9, 0x023d6f17, 0x01da1bca },
+	  { 0x00e35b25, 0x000d824f, 0x0152e9cf, 0x00ed935d, 0x020b8460,
+	    0x01c7b83f, 0x00c969e5, 0x01a74198, 0x0046a9d9, 0x00cbc768 },
+	  { 0x01597c6a, 0x0144a99b, 0x00a57551, 0x0018269c, 0x023c464c,
+	    0x0009b022, 0x00ee39e1, 0x0114c7f2, 0x038a9ad2, 0x01584c17 } },
+	{ { 0x03b0c0d5, 0x00b30a39, 0x038a6ce4, 0x01ded83a, 0x01c277a6,
+	    0x01010a61, 0x0346d3eb, 0x018d995e, 0x02f2c57c, 0x000c286b },
+	  { 0x0092aed1, 0x0125e37b, 0x027ca201, 0x001a6b6b, 0x03290f55,
+	    0x0047ba48, 0x018d916c, 0x01a59062, 0x013e35d4, 0x0002abb1 },
+	  { 0x003ad2aa, 0x007ddcc0, 0x00c10f76, 0x0001590b, 0x002cfca6,
+	    0x000ed23e, 0x00ee4329, 0x00900f04, 0x01c24065, 0x0082fa70 } },
+	{ { 0x02025e60, 0x003912b8, 0x0327041c, 0x017e5ee5, 0x02c0ecec,
+	    0x015a0d1c, 0x02b1ce7c, 0x0062220b, 0x0145067e, 0x01a5d931 },
+	  { 0x009673a6, 0x00e1f609, 0x00927c2a, 0x016faa37, 0x01650ef0,
+	    0x016f63b5, 0x03cd40e1, 0x003bc38f, 0x0361f0ac, 0x01d42acc },
+	  { 0x02f81037, 0x008ca0e8, 0x017e23d1, 0x011debfe, 0x01bcbb68,
+	    0x002e2563, 0x03e8add6, 0x000816e5, 0x03fb7075, 0x0153e5ac } },
+	{ { 0x02b11ecd, 0x016bf185, 0x008f22ef, 0x00e7d2bb, 0x0225d92e,
+	    0x00ece785, 0x00508873, 0x017e16f5, 0x01fbe85d, 0x01e39a0e },
+	  { 0x01669279, 0x017c810a, 0x024941f5, 0x0023ebeb, 0x00eb7688,
+	    0x005760f1, 0x02ca4146, 0x0073cde7, 0x0052bb75, 0x00f5ffa7 },
+	  { 0x03b8856b, 0x00cb7dcd, 0x02f14e06, 0x001820d0, 0x01d74175,
+	    0x00e59e22, 0x03fba550, 0x00484641, 0x03350088, 0x01c3c9a3 } },
+	{ { 0x00dcf355, 0x0104481c, 0x0022e464, 0x01f73fe7, 0x00e03325,
+	    0x0152b698, 0x02ef769a, 0x00973663, 0x00039b8c, 0x0101395b },
+	  { 0x01805f47, 0x019160ec, 0x03832cd0, 0x008b06eb, 0x03d4d717,
+	    0x004cb006, 0x03a75b8f, 0x013b3d30, 0x01cfad88, 0x01f034d1 },
+	  { 0x0078338a, 0x01c7d2e3, 0x02bc2b23, 0x018b3f05, 0x0280d9aa,
+	    0x005f3d44, 0x0220a95a, 0x00eeeb97, 0x0362aaec, 0x00835d51 } },
+	{ { 0x01b9f543, 0x013fac4d, 0x02ad93ae, 0x018ef464, 0x0212cdf7,
+	    0x01138ba9, 0x011583ab, 0x019c3d26, 0x028790b4, 0x00e2e2b6 },
+	  { 0x033bb758, 0x01f0dbf1, 0x03734bd1, 0x0129b1e5, 0x02b3950e,
+	    0x003bc922, 0x01a53ec8, 0x018c5532, 0x006f3cee, 0x00ae3c79 },
+	  { 0x0351f95d, 0x0012a737, 0x03d596b8, 0x017658fe, 0x00ace54a,
+	    0x008b66da, 0x0036c599, 0x012a63a2, 0x032ceba1, 0x00126bac } },
+	{ { 0x03dcfe7e, 0x019f4f18, 0x01c81aee, 0x0044bc2b, 0x00827165,
+	    0x014f7c13, 0x03b430f0, 0x00bf96cc, 0x020c8d62, 0x01471997 },
+	  { 0x01fc7931, 0x001f42dd, 0x00ba754a, 0x005bd339, 0x003fbe49,
+	    0x016b3930, 0x012a159c, 0x009f83b0, 0x03530f67, 0x01e57b85 },
+	  { 0x02ecbd81, 0x0096c294, 0x01fce4a9, 0x017701a5, 0x0175047d,
+	    0x00ee4a31, 0x012686e5, 0x008efcd4, 0x0349dc54, 0x01b3466f } },
+	{ { 0x02179ca3, 0x01d86414, 0x03f0afd0, 0x00305964, 0x015c7428,
+	    0x0099711e, 0x015d5442, 0x00c71014, 0x01b40b2e, 0x01d483cf },
+	  { 0x01afc386, 0x01984859, 0x036203ff, 0x0045c6a8, 0x0020a8aa,
+	    0x00990baa, 0x03313f10, 0x007ceede, 0x027429e4, 0x017806ce },
+	  { 0x039357a1, 0x0142f8f4, 0x0294a7b6, 0x00eaccf4, 0x0259edb3,
+	    0x01311e6e, 0x004d326f, 0x0130c346, 0x01ccef3c, 0x01c424b2 } },
+	{ { 0x0364918c, 0x00148fc0, 0x01638a7b, 0x01a1fd5b, 0x028ad013,
+	    0x0081e5a4, 0x01a54f33, 0x0174e101, 0x003d0257, 0x003a856c },
+	  { 0x00051dcf, 0x00f62b1d, 0x0143d0ad, 0x0042adbd, 0x000fda90,
+	    0x01743ceb, 0x0173e5e4, 0x017bc749, 0x03b7137a, 0x0105ce96 },
+	  { 0x00f9218a, 0x015b8c7c, 0x00e102f8, 0x0158d7e2, 0x0169a5b8,
+	    0x00b2f176, 0x018b347a, 0x014cfef2, 0x0214a4e3, 0x017f1595 } },
+	{ { 0x006d7ae5, 0x0195c371, 0x0391e26d, 0x0062a7c6, 0x003f42ab,
+	    0x010dad86, 0x024f8198, 0x01542b2a, 0x0014c454, 0x0189c471 },
+	  { 0x0390988e, 0x00b8799d, 0x02e44912, 0x0078e2e6, 0x00075654,
+	    0x01923eed, 0x0040cd72, 0x00a37c76, 0x0009d466, 0x00c8531d },
+	  { 0x02651770, 0x00609d01, 0x0286c265, 0x0134513c, 0x00ee9281,
+	    0x005d223c, 0x035c760c, 0x00679b36, 0x0073ecb8, 0x016faa50 } },
+	{ { 0x02c89be4, 0x016fc244, 0x02f38c83, 0x018beb72, 0x02b3ce2c,
+	    0x0097b065, 0x034f017b, 0x01dd957f, 0x00148f61, 0x00eab357 },
+	  { 0x0343d2f8, 0x003398fc, 0x011e368e, 0x00782a1f, 0x00019eea,
+	    0x00117b6f, 0x0128d0d1, 0x01a5e6bb, 0x01944f1b, 0x012b41e1 },
+	  { 0x03318301, 0x018ecd30, 0x0104d0b1, 0x0038398b, 0x03726701,
+	    0x019da88c, 0x002d9769, 0x00a7a681, 0x031d9028, 0x00ebfc32 } },
+	{ { 0x0220405e, 0x0171face, 0x02d930f8, 0x017f6d6a, 0x023b8c47,
+	    0x0129d5f9, 0x02972456, 0x00a3a524, 0x006f4cd2, 0x004439fa },
+	  { 0x00c53505, 0x0190c2fd, 0x00507244, 0x009930f9, 0x01a39270,
+	    0x01d327c6, 0x0399bc47, 0x01cfe13d, 0x0332bd99, 0x00b33e7d },
+	  { 0x0203f5e4, 0x003627b5, 0x00018af8, 0x01478581, 0x004a2218,
+	    0x002e3bb7, 0x039384d0, 0x0146ea62, 0x020b9693, 0x0017155f } },
+	{ { 0x03c97e6f, 0x00738c47, 0x03b5db1f, 0x01808fcf, 0x01e8fc98,
+	    0x01ed25dd, 0x01bf5045, 0x00eb5c2b, 0x0178fe98, 0x01b85530 },
+	  { 0x01c20eb0, 0x01aeec22, 0x030b9eee, 0x01b7d07e, 0x0187e16f,
+	    0x014421fb, 0x009fa731, 0x0040b6d7, 0x00841861, 0x00a27fbc },
+	  { 0x02d69abf, 0x0058cdbf, 0x0129f9ec, 0x013c19ae, 0x026c5b93,
+	    0x013a7fe7, 0x004bb2ba, 0x0063226f, 0x002a95ca, 0x01abefd9 } },
+	{ { 0x02f5d2c1, 0x00378318, 0x03734fb5, 0x01258073, 0x0263f0f6,
+	    0x01ad70e0, 0x01b56d06, 0x01188fbd, 0x011b9503, 0x0036d2e1 },
+	  { 0x0113a8cc, 0x01541c3e, 0x02ac2bbc, 0x01d95867, 0x01f47459,
+	    0x00ead489, 0x00ab5b48, 0x01db3b45, 0x00edb801, 0x004b024f },
+	  { 0x00b8190f, 0x011fe4c2, 0x00621f82, 0x010508d7, 0x001a5a76,
+	    0x00c7d7fd, 0x03aab96d, 0x019cd9dc, 0x019c6635, 0x00ceaa1e } },
+	{ { 0x01085cf2, 0x01fd47af, 0x03e3f5e1, 0x004b3e99, 0x01e3d46a,
+	    0x0060033c, 0x015ff0a8, 0x0150cdd8, 0x029e8e21, 0x008cf1bc },
+	  { 0x00156cb1, 0x003d623f, 0x01a4f069, 0x00d8d053, 0x01b68aea,
+	    0x01ca5ab6, 0x0316ae43, 0x0134dc44, 0x001c8d58, 0x0084b343 },
+	  { 0x0318c781, 0x0135441f, 0x03a51a5e, 0x019293f4, 0x0048bb37,
+	    0x013d3341, 0x0143151e, 0x019c74e1, 0x00911914, 0x0076ddde } },
+	{ { 0x006bc26f, 0x00d48e5f, 0x00227bbe, 0x00629ea8, 0x01ea5f8b,
+	    0x0179a330, 0x027a1d5f, 0x01bf8f8e, 0x02d26e2a, 0x00c6b65e },
+	  { 0x01701ab6, 0x0051da77, 0x01b4b667, 0x00a0ce7c, 0x038ae37b,
+	    0x012ac852, 0x03a0b0fe, 0x0097c2bb, 0x00a017d2, 0x01eb8b2a },
+	  { 0x0120b962, 0x0005fb42, 0x0353b6fd, 0x0061f8ce, 0x007a1463,
+	    0x01560a64, 0x00e0a792, 0x01907c92, 0x013a6622, 0x007b47f1 } }
 };
 
-// r = x mod L (little-endian)
-static void modL(u8 *r, i64 x[64])
+/*
+	conversions
+*/
+
+static void ge25519_p1p1_to_partial(ge25519 *r, const ge25519_p1p1 *p)
 {
-	for (unsigned i = 63; i >= 32; i--) {
-		i64 carry = 0;
-		FOR (j, i-32, i-12) {
-			x[j] += carry - 16 * x[i] * L[j - (i - 32)];
-			carry = (x[j] + 128) >> 8;
-			x[j] -= carry * (1 << 8);
-		}
-		x[i-12] += carry;
-		x[i] = 0;
-	}
-	i64 carry = 0;
-	FOR (i, 0, 32) {
-		x[i] += carry - (x[31] >> 4) * L[i];
-		carry = x[i] >> 8;
-		x[i] &= 255;
-	}
-	FOR (i, 0, 32) {
-		x[i] -= carry * L[i];
-	}
-	FOR (i, 0, 32) {
-		x[i+1] += x[i] >> 8;
-		r[i  ]  = x[i] & 255;
-	}
+	curve25519_mul(r->x, p->x, p->t);
+	curve25519_mul(r->y, p->y, p->z);
+	curve25519_mul(r->z, p->z, p->t);
 }
 
-// Reduces a 64-byte hash modulo L (little endian)
-static void reduce(u8 r[64])
+static void ge25519_p1p1_to_full(ge25519 *r, const ge25519_p1p1 *p)
 {
-	i64 x[64];
-	COPY(x, r, 64);
-	modL(r, x);
+	curve25519_mul(r->x, p->x, p->t);
+	curve25519_mul(r->y, p->y, p->z);
+	curve25519_mul(r->z, p->z, p->t);
+	curve25519_mul(r->t, p->x, p->y);
 }
 
-// Variable time! a must not be secret!
-static int is_above_L(const u8 a[32])
+static void ge25519_full_to_pniels(ge25519_pniels *p, const ge25519 *r)
 {
-	for (int i = 31; i >= 0; i--) {
-		if (a[i] > L[i]) { return 1; }
-		if (a[i] < L[i]) { return 0; }
+	curve25519_sub(p->ysubx, r->y, r->x);
+	curve25519_add(p->xaddy, r->y, r->x);
+	curve25519_copy(p->z, r->z);
+	curve25519_mul(p->t2d, r->t, ge25519_ec2d);
+}
+
+/*
+	adding & doubling
+*/
+
+static void ge25519_double_p1p1(ge25519_p1p1 *r, const ge25519 *p)
+{
+	bignum25519 a, b, c;
+
+	curve25519_square(a, p->x);
+	curve25519_square(b, p->y);
+	curve25519_square(c, p->z);
+	curve25519_add_reduce(c, c, c);
+	curve25519_add(r->x, p->x, p->y);
+	curve25519_square(r->x, r->x);
+	curve25519_add(r->y, b, a);
+	curve25519_sub(r->z, b, a);
+	curve25519_sub_after_basic(r->x, r->x, r->y);
+	curve25519_sub_after_basic(r->t, c, r->z);
+}
+
+static void ge25519_nielsadd2_p1p1(ge25519_p1p1 *r, const ge25519 *p,
+				   const ge25519_niels *q, uint8_t signbit)
+{
+	const bignum25519 *qb = (const bignum25519 *)q;
+	bignum25519 *rb = (bignum25519 *)r;
+	bignum25519 a, b, c;
+
+	curve25519_sub(a, p->y, p->x);
+	curve25519_add(b, p->y, p->x);
+	curve25519_mul(a, a, qb[signbit]); /* x for +, y for - */
+	curve25519_mul(r->x, b, qb[signbit ^ 1]); /* y for +, x for - */
+	curve25519_add(r->y, r->x, a);
+	curve25519_sub(r->x, r->x, a);
+	curve25519_mul(c, p->t, q->t2d);
+	curve25519_add_reduce(r->t, p->z, p->z);
+	curve25519_copy(r->z, r->t);
+	curve25519_add(rb[2 + signbit], rb[2 + signbit],
+		       c); /* z for +, t for - */
+	curve25519_sub(rb[2 + (signbit ^ 1)], rb[2 + (signbit ^ 1)],
+		       c); /* t for +, z for - */
+}
+
+static void ge25519_pnielsadd_p1p1(ge25519_p1p1 *r, const ge25519 *p,
+				   const ge25519_pniels *q, uint8_t signbit)
+{
+	const bignum25519 *qb = (const bignum25519 *)q;
+	bignum25519 *rb = (bignum25519 *)r;
+	bignum25519 a, b, c;
+
+	curve25519_sub(a, p->y, p->x);
+	curve25519_add(b, p->y, p->x);
+	curve25519_mul(a, a, qb[signbit]); /* ysubx for +, xaddy for - */
+	curve25519_mul(r->x, b, qb[signbit ^ 1]); /* xaddy for +, ysubx for - */
+	curve25519_add(r->y, r->x, a);
+	curve25519_sub(r->x, r->x, a);
+	curve25519_mul(c, p->t, q->t2d);
+	curve25519_mul(r->t, p->z, q->z);
+	curve25519_add_reduce(r->t, r->t, r->t);
+	curve25519_copy(r->z, r->t);
+	curve25519_add(rb[2 + signbit], rb[2 + signbit],
+		       c); /* z for +, t for - */
+	curve25519_sub(rb[2 + (signbit ^ 1)], rb[2 + (signbit ^ 1)],
+		       c); /* t for +, z for - */
+}
+
+static void ge25519_double(ge25519 *r, const ge25519 *p)
+{
+	ge25519_p1p1 t;
+	ge25519_double_p1p1(&t, p);
+	ge25519_p1p1_to_full(r, &t);
+}
+
+static void ge25519_pnielsadd(ge25519_pniels *r, const ge25519 *p,
+			      const ge25519_pniels *q)
+{
+	bignum25519 a, b, c, x, y, z, t;
+
+	curve25519_sub(a, p->y, p->x);
+	curve25519_add(b, p->y, p->x);
+	curve25519_mul(a, a, q->ysubx);
+	curve25519_mul(x, b, q->xaddy);
+	curve25519_add(y, x, a);
+	curve25519_sub(x, x, a);
+	curve25519_mul(c, p->t, q->t2d);
+	curve25519_mul(t, p->z, q->z);
+	curve25519_add(t, t, t);
+	curve25519_add_after_basic(z, t, c);
+	curve25519_sub_after_basic(t, t, c);
+	curve25519_mul(r->xaddy, x, t);
+	curve25519_mul(r->ysubx, y, z);
+	curve25519_mul(r->z, z, t);
+	curve25519_mul(r->t2d, x, y);
+	curve25519_copy(y, r->ysubx);
+	curve25519_sub(r->ysubx, r->ysubx, r->xaddy);
+	curve25519_add(r->xaddy, r->xaddy, y);
+	curve25519_mul(r->t2d, r->t2d, ge25519_ec2d);
+}
+
+/*
+	pack & unpack
+*/
+
+static void ge25519_pack(uint8_t r[32], const ge25519 *p)
+{
+	bignum25519 tx, ty, zi;
+	uint8_t parity[32];
+	curve25519_recip(zi, p->z);
+	curve25519_mul(tx, p->x, zi);
+	curve25519_mul(ty, p->y, zi);
+	curve25519_contract(r, ty);
+	curve25519_contract(parity, tx);
+	r[31] ^= ((parity[0] & 1) << 7);
+}
+
+static int ge25519_unpack_negative_vartime(ge25519 *r, const uint8_t p[32])
+{
+	static const uint8_t zero[32] = { 0 };
+	static const bignum25519 one = { 1 };
+	uint8_t parity = p[31] >> 7;
+	uint8_t check[32];
+	bignum25519 t, root, num, den, d3;
+
+	curve25519_expand(r->y, p);
+	curve25519_copy(r->z, one);
+	curve25519_square(num, r->y); /* x = y^2 */
+	curve25519_mul(den, num, ge25519_ecd); /* den = dy^2 */
+	curve25519_sub_reduce(num, num, r->z); /* x = y^1 - 1 */
+	curve25519_add(den, den, r->z); /* den = dy^2 + 1 */
+
+	/* Computation of sqrt(num/den) */
+	/* 1.: computation of num^((p-5)/8)*den^((7p-35)/8) = (num*den^7)^((p-5)/8) */
+	curve25519_square(t, den);
+	curve25519_mul(d3, t, den);
+	curve25519_square(r->x, d3);
+	curve25519_mul(r->x, r->x, den);
+	curve25519_mul(r->x, r->x, num);
+	curve25519_pow_two252m3(r->x, r->x);
+
+	/* 2. computation of r->x = num * den^3 * (num*den^7)^((p-5)/8) */
+	curve25519_mul(r->x, r->x, d3);
+	curve25519_mul(r->x, r->x, num);
+
+	/* 3. Check if either of the roots works: */
+	curve25519_square(t, r->x);
+	curve25519_mul(t, t, den);
+	curve25519_sub_reduce(root, t, num);
+	curve25519_contract(check, root);
+	if (!memeq(check, zero, 32)) {
+		curve25519_add_reduce(t, t, num);
+		curve25519_contract(check, t);
+		if (!memeq(check, zero, 32))
+			return 0;
+		curve25519_mul(r->x, r->x, ge25519_sqrtneg1);
 	}
+
+	curve25519_contract(check, r->x);
+	if ((check[0] & 1) == parity) {
+		curve25519_copy(t, r->x);
+		curve25519_neg(r->x, t);
+	}
+	curve25519_mul(r->t, r->x, r->y);
 	return 1;
 }
 
-// Point (group element, ge) in a twisted Edwards curve,
-// in extended projective coordinates.
-// ge        : x  = X/Z, y  = Y/Z, T  = XY/Z
-// ge_cached : Yp = X+Y, Ym = X-Y, T2 = T*D2
-// ge_precomp: Z  = 1
-typedef struct { fe X;  fe Y;  fe Z; fe T;  } ge;
-typedef struct { fe Yp; fe Ym; fe Z; fe T2; } ge_cached;
-typedef struct { fe Yp; fe Ym;       fe T2; } ge_precomp;
+/*
+	scalarmults
+*/
 
-static void ge_zero(ge *p)
-{
-	fe_0(p->X);
-	fe_1(p->Y);
-	fe_1(p->Z);
-	fe_0(p->T);
-}
+#define S1_SWINDOWSIZE 5
+#define S1_TABLE_SIZE (1 << (S1_SWINDOWSIZE - 2))
+#define S2_SWINDOWSIZE 7
 
-static void ge_tobytes(u8 s[32], const ge *h)
+/* computes [s1]p1 + [s2]basepoint */
+static void ge25519_double_scalarmult_vartime(ge25519 *r, const ge25519 *p1,
+					      const bignum256modm s1,
+					      const bignum256modm s2)
 {
-	fe recip, x, y;
-	fe_invert(recip, h->Z);
-	fe_mul(x, h->X, recip);
-	fe_mul(y, h->Y, recip);
-	fe_tobytes(s, y);
-	s[31] ^= fe_isodd(x) << 7;
-}
+	signed char slide1[256], slide2[256];
+	ge25519_pniels pre1[S1_TABLE_SIZE];
+	ge25519 d1;
+	ge25519_p1p1 t;
+	int32_t i;
 
-// h = s, where s is a point encoded in 32 bytes
-//
-// Variable time!  Inputs must not be secret!
-// => Use only to *check* signatures.
-//
-// From the specifications:
-//   The encoding of s contains y and the sign of x
-//   x = sqrt((y^2 - 1) / (d*y^2 + 1))
-// In extended coordinates:
-//   X = x, Y = y, Z = 1, T = x*y
-//
-//    Note that num * den is a square iff num / den is a square
-//    If num * den is not a square, the point was not on the curve.
-// From the above:
-//   Let num =   y^2 - 1
-//   Let den = d*y^2 + 1
-//   x = sqrt((y^2 - 1) / (d*y^2 + 1))
-//   x = sqrt(num / den)
-//   x = sqrt(num^2 / (num * den))
-//   x = num * sqrt(1 / (num * den))
-//
-// Therefore, we can just compute:
-//   num =   y^2 - 1
-//   den = d*y^2 + 1
-//   isr = invsqrt(num * den)  // abort if not square
-//   x   = num * isr
-// Finally, negate x if its sign is not as specified.
-static int ge_frombytes_vartime(ge *h, const u8 s[32])
-{
-	fe_frombytes(h->Y, s);
-	fe_1(h->Z);
-	fe_sq (h->T, h->Y);        // t =   y^2
-	fe_mul(h->X, h->T, d   );  // x = d*y^2
-	fe_sub(h->T, h->T, h->Z);  // t =   y^2 - 1
-	fe_add(h->X, h->X, h->Z);  // x = d*y^2 + 1
-	fe_mul(h->X, h->T, h->X);  // x = (y^2 - 1) * (d*y^2 + 1)
-	int is_square = invsqrt(h->X, h->X);
-	if (!is_square) {
-		return -1;             // Not on the curve, abort
+	contract256_slidingwindow_modm(slide1, s1, S1_SWINDOWSIZE);
+	contract256_slidingwindow_modm(slide2, s2, S2_SWINDOWSIZE);
+
+	ge25519_double(&d1, p1);
+	ge25519_full_to_pniels(pre1, p1);
+	for (i = 0; i < S1_TABLE_SIZE - 1; i++)
+		ge25519_pnielsadd(&pre1[i + 1], &d1, &pre1[i]);
+
+	/* set neutral */
+	memset(r, 0, sizeof(ge25519));
+	r->y[0] = 1;
+	r->z[0] = 1;
+
+	i = 255;
+	while ((i >= 0) && !(slide1[i] | slide2[i]))
+		i--;
+
+	for (; i >= 0; i--) {
+		ge25519_double_p1p1(&t, r);
+
+		if (slide1[i]) {
+			ge25519_p1p1_to_full(r, &t);
+			ge25519_pnielsadd_p1p1(&t, r, &pre1[abs(slide1[i]) / 2],
+					       (uint8_t)slide1[i] >> 7);
+		}
+
+		if (slide2[i]) {
+			ge25519_p1p1_to_full(r, &t);
+			ge25519_nielsadd2_p1p1(
+				&t, r,
+				&ge25519_niels_sliding_multiples[abs(slide2[i]) /
+								 2],
+				(uint8_t)slide2[i] >> 7);
+		}
+
+		ge25519_p1p1_to_partial(r, &t);
 	}
-	fe_mul(h->X, h->T, h->X);  // x = sqrt((y^2 - 1) / (d*y^2 + 1))
-	if (fe_isodd(h->X) != (s[31] >> 7)) {
-		fe_neg(h->X, h->X);
-	}
-	fe_mul(h->T, h->X, h->Y);
-	return 0;
 }
 
-static void ge_cache(ge_cached *c, const ge *p)
+/*
+	extra bootleg sha512
+ */
+
+static uint64_t R(uint64_t x, int c)
 {
-	fe_add (c->Yp, p->Y, p->X);
-	fe_sub (c->Ym, p->Y, p->X);
-	fe_copy(c->Z , p->Z      );
-	fe_mul (c->T2, p->T, D2  );
+	return (x >> c) | (x << (64 - c));
 }
-
-// Internal buffers are not wiped! Inputs must not be secret!
-// => Use only to *check* signatures.
-static void ge_add(ge *s, const ge *p, const ge_cached *q)
+static uint64_t Ch(uint64_t x, uint64_t y, uint64_t z)
 {
-	fe a, b;
-	fe_add(a   , p->Y, p->X );
-	fe_sub(b   , p->Y, p->X );
-	fe_mul(a   , a   , q->Yp);
-	fe_mul(b   , b   , q->Ym);
-	fe_add(s->Y, a   , b    );
-	fe_sub(s->X, a   , b    );
-
-	fe_add(s->Z, p->Z, p->Z );
-	fe_mul(s->Z, s->Z, q->Z );
-	fe_mul(s->T, p->T, q->T2);
-	fe_add(a   , s->Z, s->T );
-	fe_sub(b   , s->Z, s->T );
-
-	fe_mul(s->T, s->X, s->Y);
-	fe_mul(s->X, s->X, b   );
-	fe_mul(s->Y, s->Y, a   );
-	fe_mul(s->Z, a   , b   );
+	return (x & y) ^ (~x & z);
 }
-
-// Internal buffers are not wiped! Inputs must not be secret!
-// => Use only to *check* signatures.
-static void ge_sub(ge *s, const ge *p, const ge_cached *q)
+static uint64_t Maj(uint64_t x, uint64_t y, uint64_t z)
 {
-	ge_cached neg;
-	fe_copy(neg.Ym, q->Yp);
-	fe_copy(neg.Yp, q->Ym);
-	fe_copy(neg.Z , q->Z );
-	fe_neg (neg.T2, q->T2);
-	ge_add(s, p, &neg);
+	return (x & y) ^ (x & z) ^ (y & z);
 }
-
-static void ge_madd(ge *s, const ge *p, const ge_precomp *q, fe a, fe b)
+static uint64_t Sigma0(uint64_t x)
 {
-	fe_add(a   , p->Y, p->X );
-	fe_sub(b   , p->Y, p->X );
-	fe_mul(a   , a   , q->Yp);
-	fe_mul(b   , b   , q->Ym);
-	fe_add(s->Y, a   , b    );
-	fe_sub(s->X, a   , b    );
-
-	fe_add(s->Z, p->Z, p->Z );
-	fe_mul(s->T, p->T, q->T2);
-	fe_add(a   , s->Z, s->T );
-	fe_sub(b   , s->Z, s->T );
-
-	fe_mul(s->T, s->X, s->Y);
-	fe_mul(s->X, s->X, b   );
-	fe_mul(s->Y, s->Y, a   );
-	fe_mul(s->Z, a   , b   );
+	return R(x, 28) ^ R(x, 34) ^ R(x, 39);
 }
-
-static void ge_msub(ge *s, const ge *p, const ge_precomp *q, fe a, fe b)
+static uint64_t Sigma1(uint64_t x)
 {
-	fe_add(a   , p->Y, p->X );
-	fe_sub(b   , p->Y, p->X );
-	fe_mul(a   , a   , q->Ym);
-	fe_mul(b   , b   , q->Yp);
-	fe_add(s->Y, a   , b    );
-	fe_sub(s->X, a   , b    );
-
-	fe_add(s->Z, p->Z, p->Z );
-	fe_mul(s->T, p->T, q->T2);
-	fe_sub(a   , s->Z, s->T );
-	fe_add(b   , s->Z, s->T );
-
-	fe_mul(s->T, s->X, s->Y);
-	fe_mul(s->X, s->X, b   );
-	fe_mul(s->Y, s->Y, a   );
-	fe_mul(s->Z, a   , b   );
+	return R(x, 14) ^ R(x, 18) ^ R(x, 41);
 }
-
-static void ge_double(ge *s, const ge *p, ge *q)
+static uint64_t sigma0(uint64_t x)
 {
-	fe_sq (q->X, p->X);
-	fe_sq (q->Y, p->Y);
-	fe_sq2(q->Z, p->Z);
-	fe_add(q->T, p->X, p->Y);
-	fe_sq (s->T, q->T);
-	fe_add(q->T, q->Y, q->X);
-	fe_sub(q->Y, q->Y, q->X);
-	fe_sub(q->X, s->T, q->T);
-	fe_sub(q->Z, q->Z, q->Y);
-
-	fe_mul(s->X, q->X , q->Z);
-	fe_mul(s->Y, q->T , q->Y);
-	fe_mul(s->Z, q->Y , q->Z);
-	fe_mul(s->T, q->X , q->T);
+	return R(x, 1) ^ R(x, 8) ^ (x >> 7);
+}
+static uint64_t sigma1(uint64_t x)
+{
+	return R(x, 19) ^ R(x, 61) ^ (x >> 6);
 }
 
-// 5-bit signed window in cached format (Niels coordinates, Z=1)
-static const ge_precomp b_window[8] = {
-	{{25967493,-14356035,29566456,3660896,-12694345,
-	  4014787,27544626,-11754271,-6079156,2047605,},
-	 {-12545711,934262,-2722910,3049990,-727428,
-	  9406986,12720692,5043384,19500929,-15469378,},
-	 {-8738181,4489570,9688441,-14785194,10184609,
-	  -12363380,29287919,11864899,-24514362,-4438546,},},
-	{{15636291,-9688557,24204773,-7912398,616977,
-	  -16685262,27787600,-14772189,28944400,-1550024,},
-	 {16568933,4717097,-11556148,-1102322,15682896,
-	  -11807043,16354577,-11775962,7689662,11199574,},
-	 {30464156,-5976125,-11779434,-15670865,23220365,
-	  15915852,7512774,10017326,-17749093,-9920357,},},
-	{{10861363,11473154,27284546,1981175,-30064349,
-	  12577861,32867885,14515107,-15438304,10819380,},
-	 {4708026,6336745,20377586,9066809,-11272109,
-	  6594696,-25653668,12483688,-12668491,5581306,},
-	 {19563160,16186464,-29386857,4097519,10237984,
-	  -4348115,28542350,13850243,-23678021,-15815942,},},
-	{{5153746,9909285,1723747,-2777874,30523605,
-	  5516873,19480852,5230134,-23952439,-15175766,},
-	 {-30269007,-3463509,7665486,10083793,28475525,
-	  1649722,20654025,16520125,30598449,7715701,},
-	 {28881845,14381568,9657904,3680757,-20181635,
-	  7843316,-31400660,1370708,29794553,-1409300,},},
-	{{-22518993,-6692182,14201702,-8745502,-23510406,
-	  8844726,18474211,-1361450,-13062696,13821877,},
-	 {-6455177,-7839871,3374702,-4740862,-27098617,
-	  -10571707,31655028,-7212327,18853322,-14220951,},
-	 {4566830,-12963868,-28974889,-12240689,-7602672,
-	  -2830569,-8514358,-10431137,2207753,-3209784,},},
-	{{-25154831,-4185821,29681144,7868801,-6854661,
-	  -9423865,-12437364,-663000,-31111463,-16132436,},
-	 {25576264,-2703214,7349804,-11814844,16472782,
-	  9300885,3844789,15725684,171356,6466918,},
-	 {23103977,13316479,9739013,-16149481,817875,
-	  -15038942,8965339,-14088058,-30714912,16193877,},},
-	{{-33521811,3180713,-2394130,14003687,-16903474,
-	  -16270840,17238398,4729455,-18074513,9256800,},
-	 {-25182317,-4174131,32336398,5036987,-21236817,
-	  11360617,22616405,9761698,-19827198,630305,},
-	 {-13720693,2639453,-24237460,-7406481,9494427,
-	  -5774029,-6554551,-15960994,-2449256,-14291300,},},
-	{{-3151181,-5046075,9282714,6866145,-31907062,
-	  -863023,-18940575,15033784,25105118,-7894876,},
-	 {-24326370,15950226,-31801215,-14592823,-11662737,
-	  -5090925,1573892,-2625887,2198790,-15804619,},
-	 {-3099351,10324967,-2241613,7453183,-5446979,
-	  -2735503,-13812022,-16236442,-32461234,-12290683,},},
+static const uint64_t K[80] = {
+	0x428a2f98d728ae22ULL, 0x7137449123ef65cdULL, 0xb5c0fbcfec4d3b2fULL,
+	0xe9b5dba58189dbbcULL, 0x3956c25bf348b538ULL, 0x59f111f1b605d019ULL,
+	0x923f82a4af194f9bULL, 0xab1c5ed5da6d8118ULL, 0xd807aa98a3030242ULL,
+	0x12835b0145706fbeULL, 0x243185be4ee4b28cULL, 0x550c7dc3d5ffb4e2ULL,
+	0x72be5d74f27b896fULL, 0x80deb1fe3b1696b1ULL, 0x9bdc06a725c71235ULL,
+	0xc19bf174cf692694ULL, 0xe49b69c19ef14ad2ULL, 0xefbe4786384f25e3ULL,
+	0x0fc19dc68b8cd5b5ULL, 0x240ca1cc77ac9c65ULL, 0x2de92c6f592b0275ULL,
+	0x4a7484aa6ea6e483ULL, 0x5cb0a9dcbd41fbd4ULL, 0x76f988da831153b5ULL,
+	0x983e5152ee66dfabULL, 0xa831c66d2db43210ULL, 0xb00327c898fb213fULL,
+	0xbf597fc7beef0ee4ULL, 0xc6e00bf33da88fc2ULL, 0xd5a79147930aa725ULL,
+	0x06ca6351e003826fULL, 0x142929670a0e6e70ULL, 0x27b70a8546d22ffcULL,
+	0x2e1b21385c26c926ULL, 0x4d2c6dfc5ac42aedULL, 0x53380d139d95b3dfULL,
+	0x650a73548baf63deULL, 0x766a0abb3c77b2a8ULL, 0x81c2c92e47edaee6ULL,
+	0x92722c851482353bULL, 0xa2bfe8a14cf10364ULL, 0xa81a664bbc423001ULL,
+	0xc24b8b70d0f89791ULL, 0xc76c51a30654be30ULL, 0xd192e819d6ef5218ULL,
+	0xd69906245565a910ULL, 0xf40e35855771202aULL, 0x106aa07032bbd1b8ULL,
+	0x19a4c116b8d2d0c8ULL, 0x1e376c085141ab53ULL, 0x2748774cdf8eeb99ULL,
+	0x34b0bcb5e19b48a8ULL, 0x391c0cb3c5c95a63ULL, 0x4ed8aa4ae3418acbULL,
+	0x5b9cca4f7763e373ULL, 0x682e6ff3d6b2b8a3ULL, 0x748f82ee5defb2fcULL,
+	0x78a5636f43172f60ULL, 0x84c87814a1f0ab72ULL, 0x8cc702081a6439ecULL,
+	0x90befffa23631e28ULL, 0xa4506cebde82bde9ULL, 0xbef9a3f7b2c67915ULL,
+	0xc67178f2e372532bULL, 0xca273eceea26619cULL, 0xd186b8c721c0c207ULL,
+	0xeada7dd6cde0eb1eULL, 0xf57d4f7fee6ed178ULL, 0x06f067aa72176fbaULL,
+	0x0a637dc5a2c898a6ULL, 0x113f9804bef90daeULL, 0x1b710b35131c471bULL,
+	0x28db77f523047d84ULL, 0x32caab7b40c72493ULL, 0x3c9ebe0a15c9bebcULL,
+	0x431d67c49c100d4cULL, 0x4cc5d4becb3e42b6ULL, 0x597f299cfc657e2aULL,
+	0x5fcb6fab3ad6faecULL, 0x6c44198c4a475817ULL
 };
 
-// Incremental sliding windows (left to right)
-// Based on Roberto Maria Avanzi[2005]
-typedef struct {
-	i16 next_index; // position of the next signed digit
-	i8  next_digit; // next signed digit (odd number below 2^window_width)
-	u8  next_check; // point at which we must check for a new window
-} slide_ctx;
-
-static void slide_init(slide_ctx *ctx, const u8 scalar[32])
+static int sha512_block(uint8_t *x, const uint8_t *m, uint64_t n)
 {
-	// scalar is guaranteed to be below L, either because we checked (s),
-	// or because we reduced it modulo L (h_ram). L is under 2^253, so
-	// so bits 253 to 255 are guaranteed to be zero. No need to test them.
-	//
-	// Note however that L is very close to 2^252, so bit 252 is almost
-	// always zero.  If we were to start at bit 251, the tests wouldn't
-	// catch the off-by-one error (constructing one that does would be
-	// prohibitively expensive).
-	//
-	// We should still check bit 252, though.
-	int i = 252;
-	while (i > 0 && scalar_bit(scalar, i) == 0) {
-		i--;
-	}
-	ctx->next_check = (u8)(i + 1);
-	ctx->next_index = -1;
-	ctx->next_digit = -1;
-}
+	uint64_t z[8], b[8], a[8], w[16], t;
+	int i, j;
 
-static int slide_step(slide_ctx *ctx, int width, int i, const u8 scalar[32])
-{
-	if (i == ctx->next_check) {
-		if (scalar_bit(scalar, i) == scalar_bit(scalar, i - 1)) {
-			ctx->next_check--;
-		} else {
-			// compute digit of next window
-			int w = MIN(width, i + 1);
-			int v = -(scalar_bit(scalar, i) << (w-1));
-			FOR_T (int, j, 0, w-1) {
-				v += scalar_bit(scalar, i-(w-1)+j) << j;
+	for (i = 0; i < 8; ++i)
+		z[i] = a[i] = load_be64(x + 8 * i);
+
+	while (n >= 128) {
+		for (i = 0; i < 16; ++i)
+			w[i] = load_be64(m + 8 * i);
+
+		for (i = 0; i < 80; ++i) {
+			for (j = 0; j < 8; ++j)
+				b[j] = a[j];
+			t = a[7] + Sigma1(a[4]) + Ch(a[4], a[5], a[6]) + K[i] +
+			    w[i % 16];
+			b[7] = t + Sigma0(a[0]) + Maj(a[0], a[1], a[2]);
+			b[3] += t;
+			for (j = 0; j < 8; ++j)
+				a[(j + 1) % 8] = b[j];
+			if (i % 16 == 15) {
+				for (j = 0; j < 16; ++j)
+					w[j] += w[(j + 9) % 16] +
+						sigma0(w[(j + 1) % 16]) +
+						sigma1(w[(j + 14) % 16]);
 			}
-			v += scalar_bit(scalar, i-w);
-			int lsb = v & (~v + 1);            // smallest bit of v
-			int s   = (   ((lsb & 0xAA) != 0)  // log2(lsb)
-					   | (((lsb & 0xCC) != 0) << 1)
-					   | (((lsb & 0xF0) != 0) << 2));
-			ctx->next_index  = (i16)(i-(w-1)+s);
-			ctx->next_digit  = (i8) (v >> s   );
-			ctx->next_check -= w;
 		}
-	}
-	return i == ctx->next_index ? ctx->next_digit: 0;
-}
 
-#define P_W_WIDTH 3 // Affects the size of the stack
-#define B_W_WIDTH 5 // Affects the size of the binary
-#define P_W_SIZE  (1<<(P_W_WIDTH-2))
-
-// P = [b]B + [p]P, where B is the base point
-//
-// Variable time! Internal buffers are not wiped! Inputs must not be secret!
-// => Use only to *check* signatures.
-static void ge_double_scalarmult_vartime(ge *P, const u8 p[32], const u8 b[32])
-{
-	// cache P window for addition
-	ge_cached cP[P_W_SIZE];
-	{
-		ge P2, tmp;
-		ge_double(&P2, P, &tmp);
-		ge_cache(&cP[0], P);
-		FOR (i, 1, P_W_SIZE) {
-			ge_add(&tmp, &P2, &cP[i-1]);
-			ge_cache(&cP[i], &tmp);
+		for (i = 0; i < 8; ++i) {
+			a[i] += z[i];
+			z[i] = a[i];
 		}
+
+		m += 128;
+		n -= 128;
 	}
 
-	// Merged double and add ladder, fused with sliding
-	slide_ctx p_slide;  slide_init(&p_slide, p);
-	slide_ctx b_slide;  slide_init(&b_slide, b);
-	int i = MAX(p_slide.next_check, b_slide.next_check);
-	ge *sum = P;
-	ge_zero(sum);
-	while (i >= 0) {
-		ge tmp;
-		ge_double(sum, sum, &tmp);
-		int p_digit = slide_step(&p_slide, P_W_WIDTH, i, p);
-		int b_digit = slide_step(&b_slide, B_W_WIDTH, i, b);
-		if (p_digit > 0) { ge_add(sum, sum, &cP[ p_digit / 2]); }
-		if (p_digit < 0) { ge_sub(sum, sum, &cP[-p_digit / 2]); }
-		fe t1, t2;
-		if (b_digit > 0) { ge_madd(sum, sum, b_window +  b_digit/2, t1, t2); }
-		if (b_digit < 0) { ge_msub(sum, sum, b_window + -b_digit/2, t1, t2); }
-		i--;
-	}
+	for (i = 0; i < 8; ++i)
+		store_be64(x + 8 * i, z[i]);
+
+	return n;
 }
 
-// R_check = s[B] - h_ram[pk], where B is the base point
-//
-// Variable time! Internal buffers are not wiped! Inputs must not be secret!
-// => Use only to *check* signatures.
-static int ge_r_check(u8 R_check[32], const u8 s[32], const u8 h_ram[32], const u8 pk[32])
+static const uint8_t sha512_iv[64] = {
+	0x6a, 0x09, 0xe6, 0x67, 0xf3, 0xbc, 0xc9, 0x08, 0xbb, 0x67, 0xae,
+	0x85, 0x84, 0xca, 0xa7, 0x3b, 0x3c, 0x6e, 0xf3, 0x72, 0xfe, 0x94,
+	0xf8, 0x2b, 0xa5, 0x4f, 0xf5, 0x3a, 0x5f, 0x1d, 0x36, 0xf1, 0x51,
+	0x0e, 0x52, 0x7f, 0xad, 0xe6, 0x82, 0xd1, 0x9b, 0x05, 0x68, 0x8c,
+	0x2b, 0x3e, 0x6c, 0x1f, 0x1f, 0x83, 0xd9, 0xab, 0xfb, 0x41, 0xbd,
+	0x6b, 0x5b, 0xe0, 0xcd, 0x19, 0x13, 0x7e, 0x21, 0x79
+};
+
+static void sha512(uint8_t *h, const uint8_t first_32[32],
+		   const uint8_t middle_32[32], const uint8_t *m, size_t n)
 {
-	ge A; // not secret, not wiped
-	if (ge_frombytes_vartime(&A, pk) ||         // A = pk
-		is_above_L(s)) {                    // prevent s malleability
-		return -1;
+	uint8_t x[256];
+	uint64_t i, b = n + 64;
+
+	memcpy(h, sha512_iv, 64);
+	memcpy(x, first_32, 32);
+	memcpy(x + 32, middle_32, 32);
+	i = n > 64 ? 64 : n;
+	memcpy(x + 64, m, i);
+	if (i < 64 || n == 64) {
+		n = b;
+		memset(x + n, 0, 256 - n);
+		goto final;
 	}
-	fe_neg(A.X, A.X);
-	fe_neg(A.T, A.T);                           // A = -pk
-	ge_double_scalarmult_vartime(&A, h_ram, s); // A = [s]B - [h_ram]pk
-	ge_tobytes(R_check, &A);                    // R_check = A
-	return 0;
+	sha512_block(h, x, 64 + i);
+	n -= i, m += i;
+	if (n) {
+		sha512_block(h, m, n);
+		m += n - (n & 127);
+		n = b & 127;
+		memcpy(x, m, n);
+		memset(x + n, 0, 256 - n);
+	}
+
+final:
+	x[n] = 128;
+	n = 256 - 128 * (n < 112);
+	x[n - 9] = b >> 61;
+	store_be64(x + n - 8, b << 3);
+	sha512_block(h, x, n);
 }
 
-bool ed25519_verify(const u8 signature[64], const u8 public_key[32],
+bool ed25519_verify(const uint8_t signature[64], const uint8_t public_key[32],
 		    const void *message, size_t message_size)
 {
-	sha512_ctx hash;
-	u8 h_ram[64];
-	u8 R_check[32];
+	ge25519 R, A;
+	uint8_t hash[64];
+	bignum256modm hram, S;
+	uint8_t checkR[32];
 
-	sha512_init(&hash);
-	sha512_update(&hash, signature, 32);
-	sha512_update(&hash, public_key, 32);
-	sha512_update(&hash, message, message_size);
-	sha512_final(&hash, h_ram);
-
-	reduce(h_ram);
-	if (ge_r_check(R_check, signature + 32, h_ram, public_key))
+	if ((signature[63] & 224) ||
+	    !ge25519_unpack_negative_vartime(&A, public_key))
 		return false;
-	return verify32(signature, R_check) == 0 ? true : false;
+
+	/* hram = H(R,A,m) */
+	sha512(hash, signature, public_key, message, message_size);
+	expand256_modm(hram, hash, 64);
+
+	/* S */
+	expand256_modm(S, signature + 32, 32);
+
+	/* SB - H(R,A,m)A */
+	ge25519_double_scalarmult_vartime(&R, &A, hram, S);
+	ge25519_pack(checkR, &R);
+
+	/* check that R = SB - H(R,A,m)A */
+	return memeq(signature, checkR, 32);
+}
+
+static const uint64_t blake2b_iv[8] = {
+	0x6a09e667f3bcc908ULL, 0xbb67ae8584caa73bULL, 0x3c6ef372fe94f82bULL,
+	0xa54ff53a5f1d36f1ULL, 0x510e527fade682d1ULL, 0x9b05688c2b3e6c1fULL,
+	0x1f83d9abfb41bd6bULL, 0x5be0cd19137e2179ULL
+};
+
+static const uint8_t blake2b_sigma[12][16] = {
+	{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+	{ 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 },
+	{ 11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4 },
+	{ 7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8 },
+	{ 9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13 },
+	{ 2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9 },
+	{ 12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11 },
+	{ 13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10 },
+	{ 6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5 },
+	{ 10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0 },
+	{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15 },
+	{ 14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3 }
+};
+
+#define G(r, i, a, b, c, d)                                                    \
+	do {                                                                   \
+		a = a + b + m[blake2b_sigma[r][2 * i + 0]];                    \
+		d = ror64(d ^ a, 32);                                          \
+		c = c + d;                                                     \
+		b = ror64(b ^ c, 24);                                          \
+		a = a + b + m[blake2b_sigma[r][2 * i + 1]];                    \
+		d = ror64(d ^ a, 16);                                          \
+		c = c + d;                                                     \
+		b = ror64(b ^ c, 63);                                          \
+	} while (0)
+
+#define ROUND(r)                                                               \
+	do {                                                                   \
+		G(r, 0, v[0], v[4], v[8], v[12]);                              \
+		G(r, 1, v[1], v[5], v[9], v[13]);                              \
+		G(r, 2, v[2], v[6], v[10], v[14]);                             \
+		G(r, 3, v[3], v[7], v[11], v[15]);                             \
+		G(r, 4, v[0], v[5], v[10], v[15]);                             \
+		G(r, 5, v[1], v[6], v[11], v[12]);                             \
+		G(r, 6, v[2], v[7], v[8], v[13]);                              \
+		G(r, 7, v[3], v[4], v[9], v[14]);                              \
+	} while (0)
+
+static void blake2b256_compress(struct blake2b256_state *state,
+				const uint8_t block[128])
+{
+	uint64_t m[16];
+	uint64_t v[16];
+
+	for (int i = 0; i < 16; ++i)
+		m[i] = load_le64(block + i * sizeof(m[i]));
+
+	for (int i = 0; i < 8; ++i)
+		v[i] = state->h[i];
+
+	memcpy(v + 8, blake2b_iv, sizeof(blake2b_iv));
+	v[12] ^= state->t[0];
+	v[13] ^= state->t[1];
+	v[14] ^= state->f[0];
+	v[15] ^= state->f[1];
+
+	for (int i = 0; i < 12; ++i)
+		ROUND(i);
+	for (int i = 0; i < 8; ++i)
+		state->h[i] = state->h[i] ^ v[i] ^ v[i + 8];
+}
+
+void blake2b256_init(struct blake2b256_state *state)
+{
+	memset(state, 0, sizeof(*state));
+	memcpy(state->h, blake2b_iv, sizeof(state->h));
+	state->h[0] ^= 0x01010000 | 32;
+}
+
+void blake2b256_update(struct blake2b256_state *state, const uint8_t *in,
+		       unsigned int inlen)
+{
+	const size_t left = state->buflen;
+	const size_t fill = 128 - left;
+
+	if (!inlen)
+		return;
+
+	if (inlen > fill) {
+		state->buflen = 0;
+		memcpy(state->buf + left, in, fill);
+		state->t[0] += 128;
+		state->t[1] += (state->t[0] < 128);
+		blake2b256_compress(state, state->buf);
+		in += fill;
+		inlen -= fill;
+		while (inlen > 128) {
+			state->t[0] += 128;
+			state->t[1] += (state->t[0] < 128);
+			blake2b256_compress(state, in);
+			in += 128;
+			inlen -= 128;
+		}
+	}
+	memcpy(state->buf + state->buflen, in, inlen);
+	state->buflen += inlen;
+}
+
+void blake2b256_final(struct blake2b256_state *state, uint8_t *out)
+{
+	state->t[0] += state->buflen;
+	state->t[1] += (state->t[0] < state->buflen);
+	state->f[0] = (uint64_t)-1;
+	memset(state->buf + state->buflen, 0, 128 - state->buflen);
+	blake2b256_compress(state, state->buf);
+
+	for (int i = 0; i < 8; ++i)
+		store_le64(out + i * sizeof(state->h[i]), state->h[i]);
 }
