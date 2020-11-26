@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
@@ -133,7 +134,30 @@ func pipeFromHandleArgument(handleStr string) (*os.File, error) {
 	return os.NewFile(uintptr(handleInt), "pipe"), nil
 }
 
+//TODO: move to x/sys/windows when https://go-review.googlesource.com/c/sys/+/273606 lands
+func windowsSetDllDirectory(directory string) (err error) {
+	r, _, e := windows.NewLazySystemDLL("kernel32.dll").NewProc("SetDllDirectoryW").Call(uintptr(unsafe.Pointer(windows.StringToUTF16Ptr(directory))))
+	if r == 0 {
+		err = e
+	}
+	return
+}
+
+//TODO: move to x/sys/windows when https://go-review.googlesource.com/c/sys/+/273606 lands
+const _LOAD_LIBRARY_SEARCH_SYSTEM32 = 0x00000800
+func windowsSetDefaultDllDirectories(flags uint32) (err error) {
+	r, _, e := windows.NewLazySystemDLL("kernel32.dll").NewProc("SetDefaultDllDirectories").Call(uintptr(flags))
+	if r == 0 {
+		err = e
+	}
+	return
+}
+
 func main() {
+	if windowsSetDllDirectory("") != nil || windowsSetDefaultDllDirectories(_LOAD_LIBRARY_SEARCH_SYSTEM32) != nil {
+		panic("failed to restrict dll search path")
+	}
+
 	checkForWow64()
 
 	if len(os.Args) <= 1 {
